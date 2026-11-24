@@ -52,6 +52,14 @@ import {
   buildUnclearSceneVideoPromptPack,
 } from '../utils/unclearSceneAudit';
 import {
+  buildRegVideoPromptForClearFaceStill,
+  classifyClearFacePhotoCategory,
+  getClearFaceCategoryLabel,
+  type ClearFacePhotoCategory,
+  type ClearFaceSearchMode,
+} from '../utils/clearFaceScenePlanner';
+import { resolveModalCharacterName } from '../utils/videoCutPlanner';
+import {
   analyzeVoiceCloneDNAFromAudioFile,
   BG_MUSIC_STYLE_LABELS,
   loadActiveVoiceCloneDNA,
@@ -231,19 +239,32 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
       Array<{
         title: string;
         dataUrl: string;
+        sourceUrl?: string;
         year?: number | null;
         stageLabel?: string;
+        photoCategory?: ClearFacePhotoCategory;
+        photoCategoryLabel?: string;
       }>
     >
   >({});
   const [seenScenePhotoUrls, setSeenScenePhotoUrls] = useState<Record<string, string[]>>({});
+  const [clearFaceFetchMode, setClearFaceFetchMode] = useState<ClearFaceSearchMode | null>(null);
+  const [activePhotoCatFilter, setActivePhotoCatFilter] = useState<ClearFaceSearchMode>('all');
+  const [clearFaceStatusNote, setClearFaceStatusNote] = useState<string | null>(null);
+
+  const resolvedActiveCharacterName = resolveModalCharacterName({
+    projectTitle: settings.projectTitle,
+    activeSceneNarration: activeScene?.narrationText,
+    firstSceneNarration: scenes[0]?.narrationText,
+    savedStoryTopic: savedAudioPrefs.storyTopic,
+  });
 
   const activeSceneStageInfo = activeScene
     ? classifySceneStoryStage(
         activeScene,
         Math.max(0, scenes.findIndex((s) => s.id === activeScene.id)),
         scenes.length,
-        cleanCharacterNameForSearch(savedAudioPrefs.storyTopic || settings.projectTitle)
+        cleanCharacterNameForSearch(resolvedActiveCharacterName)
       )
     : null;
 
@@ -252,7 +273,7 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
     setIsFetchingRealPhoto(true);
     try {
       const cleanCharName =
-        cleanCharacterNameForSearch(savedAudioPrefs.storyTopic || settings.projectTitle) ||
+        cleanCharacterNameForSearch(resolvedActiveCharacterName) ||
         settings.projectTitle;
       const prevSeen = seenScenePhotoUrls[activeScene.id] || [];
       const excludeList = activeScene.mediaUrl
@@ -327,10 +348,142 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
     }
   };
 
+  const handleFetchClearFaceScenePhotos = async (mode: ClearFaceSearchMode) => {
+    if (!activeScene || clearFaceFetchMode) return;
+    setClearFaceFetchMode(mode);
+    setClearFaceStatusNote(null);
+    try {
+      const cleanCharName =
+        cleanCharacterNameForSearch(resolvedActiveCharacterName) ||
+        settings.projectTitle;
+      const res = await fetch('/api/archival/search-scene-media', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: cleanCharName,
+          characterName: cleanCharName,
+          sceneDurationSec: Math.max(5, Math.round(activeScene.durationSec || 8)),
+          limit: 16,
+          photoFocusMode: mode,
+          skipVideos: true,
+          sceneContext: {
+            id: activeScene.id,
+            order: activeScene.order,
+            title: activeScene.title,
+            narrationText: activeScene.narrationText,
+            archivalKeywords: activeScene.archivalKeywords,
+          },
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const rawList: Array<{
+          title: string;
+          dataUrl: string;
+          sourceUrl?: string;
+          year?: number | null;
+          stageLabel?: string;
+          photoCategory?: ClearFacePhotoCategory;
+          photoCategoryLabel?: string;
+        }> = Array.isArray(data?.photoOptions) ? data.photoOptions : [];
+
+        if (rawList.length > 0) {
+          const normalized = rawList.map((item) => {
+            const cat =
+              item.photoCategory ||
+              classifyClearFacePhotoCategory(item.title, item.sourceUrl || '');
+            return {
+              ...item,
+              photoCategory: cat,
+              photoCategoryLabel: item.photoCategoryLabel || getClearFaceCategoryLabel(cat),
+            };
+          });
+
+          setStagePhotoOptionsByScene((prev) => {
+            const existing = prev[activeScene.id] || [];
+            const seen = new Set(normalized.map((p) => p.dataUrl.slice(0, 120)));
+            const merged = [
+              ...normalized,
+              ...existing.filter((p) => !seen.has(p.dataUrl.slice(0, 120))),
+            ].slice(0, 24);
+            return { ...prev, [activeScene.id]: merged };
+          });
+          setActivePhotoCatFilter(mode);
+          const modeLabel =
+            mode === 'film-still'
+              ? 'Cảnh Phim Rõ Mặt'
+              : mode === 'activity-scene'
+              ? 'Hoạt Động & Hậu Trường Rõ Mặt'
+              : mode === 'portrait'
+              ? 'Chân Dung Cận Mặt'
+              : 'Cảnh Phim & Hoạt Động Rõ Mặt';
+          setClearFaceStatusNote(
+            `✅ Đã bổ sung ${normalized.length} ảnh ${modeLabel} — bấm vào ảnh bất kỳ để gắn & tạo Prompt Reg Video rõ mặt!`
+          );
+        } else {
+          setClearFaceStatusNote(
+            '⚠️ Chưa tìm thấy thêm ảnh mới cho nhóm này — thử chuyển sang nhóm khác hoặc mở Tìm Kiếm Chi Tiết.'
+          );
+        }
+      }
+    } catch {
+      setClearFaceStatusNote('⚠️ Không thể kết nối lấy ảnh lúc này, vui lòng thử lại.');
+    } finally {
+      setClearFaceFetchMode(null);
+    }
+  };
+
+  const handleApplyClearFaceStillForRegVideo = (opt: {
+    title: string;
+    dataUrl: string;
+    sourceUrl?: string;
+    stageLabel?: string;
+    photoCategory?: ClearFacePhotoCategory;
+    photoCategoryLabel?: string;
+  }) => {
+    if (!activeScene) return;
+    const cleanCharName =
+      cleanCharacterNameForSearch(resolvedActiveCharacterName) ||
+      settings.projectTitle;
+    const cat =
+      opt.photoCategory || classifyClearFacePhotoCategory(opt.title, opt.sourceUrl || '');
+    const catLabel = opt.photoCategoryLabel || getClearFaceCategoryLabel(cat);
+    const regVideoPrompt = buildRegVideoPromptForClearFaceStill({
+      characterName: cleanCharName,
+      sceneTitle: activeScene.title,
+      narrationText: activeScene.narrationText,
+      photoTitle: opt.title,
+      photoCategory: cat,
+      aspectRatio: settings.aspectRatio,
+    });
+
+    const keepExistingVideoClip =
+      activeScene.mediaKind === 'video' && Boolean(activeScene.mediaUrl);
+
+    onUpdateScene(activeScene.id, {
+      ...(keepExistingVideoClip
+        ? {}
+        : {
+            mediaUrl: opt.dataUrl,
+            mediaKind: 'image',
+          }),
+      hasRealPhoto: true,
+      characterRefPhotoUrl: opt.dataUrl,
+      realPhotoTitle: `[${catLabel}] ${opt.title}`,
+      videoMotionPrompt: regVideoPrompt,
+      frameStyle: 'full-bleed',
+      showBottomSubtitles: true,
+    });
+    setClearFaceStatusNote(
+      `✨ Đã gắn ảnh ${catLabel} làm Ảnh Gốc + cập nhật Prompt Khóa Khuôn Mặt để Reg Video!`
+    );
+  };
+
   const handleDownloadFullFrame = async () => {
     const targetUrl =
-      (activeScene?.hasRealPhoto && activeScene?.mediaUrl) ||
+      (activeScene?.mediaKind === 'video' && activeScene?.characterRefPhotoUrl) ||
       activeScene?.characterRefPhotoUrl ||
+      (activeScene?.hasRealPhoto && activeScene?.mediaUrl) ||
       activeScene?.mediaUrl;
     if (!targetUrl || isDownloadingFullFrame || !activeScene) return;
     setIsDownloadingFullFrame(true);
@@ -969,58 +1122,159 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
                 );
               })()}
 
-              {(stagePhotoOptionsByScene[activeScene.id]?.length ?? 0) > 1 && (
-                <div className="space-y-1.5 rounded-md bg-slate-900/80 border border-slate-800 p-2">
-                  <div className="flex items-center justify-between text-[10px] text-slate-400">
-                    <span className="font-semibold text-amber-300">
-                      Ảnh nhân vật tìm được ({stagePhotoOptionsByScene[activeScene.id].length} ảnh) — bấm để đổi:
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-4 gap-1.5 max-h-40 overflow-y-auto pr-0.5">
-                    {stagePhotoOptionsByScene[activeScene.id].map((opt, idx) => {
-                      const isSelected = activeScene.mediaUrl === opt.dataUrl;
-                      return (
+              {/* Dedicated 1-Click Clear-Face Movie Scene & Real-Life Activity Picker for Reg Video */}
+              <div className="rounded-lg bg-slate-900/80 border border-sky-500/40 p-2.5 space-y-2">
+                <div className="flex items-center justify-between gap-1.5">
+                  <span className="text-[11px] font-bold text-sky-300 flex items-center gap-1">
+                    <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span>🎬 Bổ Sung Ảnh Cảnh Phim &amp; Hoạt Động Rõ Mặt (Reg Video):</span>
+                  </span>
+                </div>
+                <p className="text-[10px] text-slate-400 leading-snug">
+                  Lấy thêm khung hình diễn viên trong cảnh phim &amp; hoạt động ngoài đời nhìn rõ khuôn mặt để tải 3:4 HD + copy prompt reg video chuẩn nhân vật.
+                </p>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      { id: 'film-still' as const, label: '🎬 Cảnh Phim', color: 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border-amber-500/40' },
+                      { id: 'activity-scene' as const, label: '🎯 Hoạt Động', color: 'bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border-sky-500/40' },
+                      { id: 'portrait' as const, label: '👤 Chân Dung', color: 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border-emerald-500/40' },
+                    ]
+                  ).map((btn) => {
+                    const isLoadingThis = clearFaceFetchMode === btn.id;
+                    return (
+                      <button
+                        key={btn.id}
+                        type="button"
+                        disabled={Boolean(clearFaceFetchMode)}
+                        onClick={() => handleFetchClearFaceScenePhotos(btn.id)}
+                        className={`flex items-center justify-center gap-1 px-2 py-1.5 text-[10px] font-bold border rounded-md transition-colors disabled:opacity-50 ${btn.color}`}
+                      >
+                        {isLoadingThis ? (
+                          <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                        ) : null}
+                        <span className="truncate">{btn.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {clearFaceStatusNote && (
+                  <p className="text-[10px] font-medium text-emerald-300 bg-emerald-500/10 border border-emerald-500/30 rounded px-2 py-1">
+                    {clearFaceStatusNote}
+                  </p>
+                )}
+
+                {(stagePhotoOptionsByScene[activeScene.id]?.length ?? 0) > 0 && (() => {
+                  const allSceneOpts = stagePhotoOptionsByScene[activeScene.id] || [];
+                  const filteredOpts =
+                    activePhotoCatFilter === 'all'
+                      ? allSceneOpts
+                      : allSceneOpts.filter((o) => {
+                          const cat =
+                            o.photoCategory ||
+                            classifyClearFacePhotoCategory(o.title, o.sourceUrl || '');
+                          return cat === activePhotoCatFilter;
+                        });
+                  const visibleOpts = filteredOpts.length > 0 ? filteredOpts : allSceneOpts;
+                  return (
+                    <div className="space-y-1.5 pt-1 border-t border-slate-800">
+                      <div className="flex flex-wrap items-center justify-between gap-1">
+                        <span className="text-[10px] font-semibold text-amber-300">
+                          Chọn ảnh rõ mặt để gắn &amp; tạo Prompt Reg Video ({visibleOpts.length}/{allSceneOpts.length}):
+                        </span>
+                        <div className="flex items-center gap-1">
+                          {(
+                            [
+                              { id: 'all' as const, label: 'Tất cả' },
+                              { id: 'film-still' as const, label: '🎬 Phim' },
+                              { id: 'activity-scene' as const, label: '🎯 Hoạt động' },
+                              { id: 'portrait' as const, label: '👤 Chân dung' },
+                            ]
+                          ).map((tab) => (
+                            <button
+                              key={tab.id}
+                              type="button"
+                              onClick={() => setActivePhotoCatFilter(tab.id)}
+                              className={`px-1.5 py-0.5 rounded text-[9px] font-bold border transition-colors ${
+                                activePhotoCatFilter === tab.id
+                                  ? 'bg-amber-500 text-slate-950 border-amber-400'
+                                  : 'bg-slate-800 text-slate-300 border-slate-700 hover:border-amber-400/50'
+                              }`}
+                            >
+                              {tab.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-4 gap-1.5 max-h-48 overflow-y-auto pr-0.5">
+                        {visibleOpts.map((opt, idx) => {
+                          const isSelected =
+                            activeScene.characterRefPhotoUrl === opt.dataUrl ||
+                            activeScene.mediaUrl === opt.dataUrl;
+                          const cat =
+                            opt.photoCategory ||
+                            classifyClearFacePhotoCategory(opt.title, opt.sourceUrl || '');
+                          const catBadge =
+                            opt.photoCategoryLabel || getClearFaceCategoryLabel(cat);
+                          return (
+                            <button
+                              key={`${activeScene.id}-stage-opt-${idx}`}
+                              type="button"
+                              onClick={() => handleApplyClearFaceStillForRegVideo(opt)}
+                              title={`${catBadge} — ${opt.title} (Bấm để gắn Ảnh Gốc + Tạo Prompt Reg Video Rõ Mặt)`}
+                              aria-label={`Chọn ảnh rõ mặt ${catBadge} ${opt.title}`}
+                              className={`group relative aspect-[3/4] rounded overflow-hidden border transition-all ${
+                                isSelected
+                                  ? 'border-amber-400 ring-2 ring-amber-400'
+                                  : 'border-slate-700 hover:border-amber-400/70'
+                              }`}
+                            >
+                              <img
+                                src={opt.dataUrl}
+                                alt={opt.title}
+                                className="w-full h-full object-cover object-[50%_22%]"
+                                loading="lazy"
+                              />
+                              <span className="absolute top-0 inset-x-0 bg-black/75 text-[8px] font-bold leading-tight text-amber-200 px-1 py-0.5 truncate">
+                                {catBadge}
+                              </span>
+                              {opt.year && (
+                                <span className="absolute bottom-0 right-0 bg-black/75 text-[8px] leading-tight text-slate-200 px-1 py-0.5">
+                                  {opt.year}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {activeScene.videoMotionPrompt && (
                         <button
-                          key={`${activeScene.id}-stage-opt-${idx}`}
                           type="button"
                           onClick={() =>
-                            onUpdateScene(activeScene.id, {
-                              mediaUrl: opt.dataUrl,
-                              mediaKind: 'image',
-                              hasRealPhoto: true,
-                              characterRefPhotoUrl: opt.dataUrl,
-                              realPhotoTitle: opt.stageLabel
-                                ? `[${opt.stageLabel}] ${opt.title}`
-                                : opt.title,
-                              frameStyle: 'full-bleed',
-                              showBottomSubtitles: true,
-                            })
+                            copyPrompt(activeScene.videoMotionPrompt || '', 'clear-face-reg-prompt')
                           }
-                          title={`${opt.stageLabel ? `[${opt.stageLabel}] ` : ''}${opt.title}`}
-                          aria-label={`Chọn ảnh ${opt.title}`}
-                          className={`group relative aspect-[3/4] rounded overflow-hidden border transition-all ${
-                            isSelected
-                              ? 'border-amber-400 ring-1 ring-amber-400'
-                              : 'border-slate-700 hover:border-amber-400/70'
-                          }`}
+                          className="w-full flex items-center justify-center gap-1.5 px-2 py-1 text-[10px] font-bold bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded transition-colors"
                         >
-                          <img
-                            src={opt.dataUrl}
-                            alt={opt.title}
-                            className="w-full h-full object-cover"
-                            loading="lazy"
-                          />
-                          {opt.stageLabel && (
-                            <span className="absolute bottom-0 inset-x-0 bg-black/75 text-[8px] leading-tight text-amber-200 px-1 py-0.5 truncate">
-                              {opt.year || opt.stageLabel}
-                            </span>
+                          {copiedField === 'clear-face-reg-prompt' ? (
+                            <>
+                              <Check className="w-3 h-3 text-emerald-400" />
+                              <span>Đã Copy Prompt Khóa Khuôn Mặt Reg Video!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3 h-3" />
+                              <span>📋 Copy Prompt Reg Video Rõ Mặt (Grok / Kling AI)</span>
+                            </>
                           )}
                         </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
 
               {(activeScene.mediaUrl || activeScene.characterRefPhotoUrl) && (
                 <button

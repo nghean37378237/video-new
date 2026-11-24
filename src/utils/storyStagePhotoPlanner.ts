@@ -45,6 +45,8 @@ export interface VerifiedStagePhotoCandidate {
   year: number | null;
   stage?: StoryPhotoStageId;
   stageLabel?: string;
+  photoCategory?: 'film-still' | 'activity-scene' | 'portrait';
+  photoCategoryLabel?: string;
 }
 
 export const STORY_STAGE_META: Record<
@@ -74,15 +76,15 @@ export const STORY_STAGE_META: Record<
   'peak-cinema': {
     labelVi: 'Đỉnh Cao Điện Ảnh & Vai Diễn',
     shortVi: 'Đỉnh cao phim',
-    defaultQueryModifiers: ['closeup movie still portrait', 'film role portrait', 'classic cinema headshot', 'character portrait'],
-    allowMultiSubject: false,
+    defaultQueryModifiers: ['movie scene still closeup face', 'film still actor role face', 'cinema still closeup', 'character role movie scene'],
+    allowMultiSubject: true,
     chronologicalOrder: 3,
   },
   'personal-behind-scenes': {
     labelVi: 'Đời Tư, Đam Mê & Hậu Trường',
     shortVi: 'Hậu trường',
-    defaultQueryModifiers: ['candid portrait closeup', 'interview portrait face', 'off screen portrait', 'smiling portrait'],
-    allowMultiSubject: false,
+    defaultQueryModifiers: ['behind the scenes on set candid face', 'interview speaking closeup face', 'off screen candid activity', 'smiling candid face'],
+    allowMultiSubject: true,
     chronologicalOrder: 4,
   },
   'later-years': {
@@ -518,18 +520,18 @@ export function buildRichStagePhotoQueries(
       priority: 8,
     },
     {
-      query: `${cleanChar} closeup film still portrait`,
+      query: `${cleanChar} movie scene still closeup face`,
       stage: 'peak-cinema',
       stageLabelVi: STORY_STAGE_META['peak-cinema'].labelVi,
-      allowMultiSubject: false,
+      allowMultiSubject: true,
       targetYear: null,
       priority: 8,
     },
     {
-      query: `${cleanChar} candid portrait smiling closeup`,
+      query: `${cleanChar} behind the scenes on set candid face`,
       stage: 'personal-behind-scenes',
       stageLabelVi: STORY_STAGE_META['personal-behind-scenes'].labelVi,
-      allowMultiSubject: false,
+      allowMultiSubject: true,
       targetYear: null,
       priority: 7,
     },

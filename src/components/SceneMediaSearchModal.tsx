@@ -24,6 +24,14 @@ import {
   shouldMountInlineVideoScrubber,
 } from '../utils/videoCutPlanner';
 import { cutVideoInBrowser } from '../utils/clientVideoCutter';
+import {
+  classifyClearFacePhotoCategory,
+  getClearFaceCategoryLabel,
+  sortAndBalanceClearFacePhotos,
+  type ClearFacePhotoCategory,
+  type ClearFaceSearchMode,
+} from '../utils/clearFaceScenePlanner';
+import { downloadFullFrameImageForGrok } from '../utils/fullFrameHelper';
 
 export interface SceneVideoOption {
   id: string;
@@ -44,9 +52,13 @@ export interface ScenePhotoOption {
   mediaKind: 'image';
   title: string;
   dataUrl: string;
+  sourceUrl?: string;
   width: number;
   height: number;
   year?: number | null;
+  stageLabel?: string;
+  photoCategory?: ClearFacePhotoCategory;
+  photoCategoryLabel?: string;
 }
 
 export interface YouTubeSearchVideoItem {
@@ -185,6 +197,9 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
   // Archival video & photo results
   const [videoOptions, setVideoOptions] = useState<SceneVideoOption[]>([]);
   const [photoOptions, setPhotoOptions] = useState<ScenePhotoOption[]>([]);
+  const [photoFocusMode, setPhotoFocusMode] = useState<ClearFaceSearchMode>('all');
+  const [isLoadingClearFacePhotos, setIsLoadingClearFacePhotos] = useState<boolean>(false);
+  const [downloadingPhotoId, setDownloadingPhotoId] = useState<string | null>(null);
   const [customTrimStarts, setCustomTrimStarts] = useState<Record<string, number>>({});
   const [customTrimEnds, setCustomTrimEnds] = useState<Record<string, number>>({});
   const [videoPlayheadSec, setVideoPlayheadSec] = useState<Record<string, number>>({});
@@ -635,7 +650,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
       }
     };
 
-    // 1. Fire Archival Videos & Photos search in parallel (Archive.org MP4 + Wikimedia Commons)
+    // 1. Fire Archival Videos & Clear-Face Photos (Movie Stills + Activities + Portraits) in parallel
     fetch('/api/archival/search-scene-media', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -646,6 +661,16 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
         limit: 20,
         videoLimit: 14,
         cycleOffset: nextCycle,
+        photoFocusMode: 'all',
+        sceneContext: effectiveScene
+          ? {
+              id: effectiveScene.id,
+              order: effectiveScene.order,
+              title: effectiveScene.title,
+              narrationText: effectiveScene.narrationText,
+              archivalKeywords: effectiveScene.archivalKeywords,
+            }
+          : null,
       }),
     })
       .then(async (archRes) => {
@@ -770,6 +795,57 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     }
   };
 
+  const fetchClearFacePhotosByMode = async (
+    mode: ClearFaceSearchMode,
+    append = true
+  ) => {
+    if (isLoadingClearFacePhotos) return;
+    setIsLoadingClearFacePhotos(true);
+    try {
+      const effectiveQuery = searchQuery.trim() || cleanCharName;
+      const res = await fetch('/api/archival/search-scene-media', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: effectiveQuery,
+          characterName: cleanCharName,
+          sceneDurationSec: sceneDur,
+          limit: 18,
+          cycleOffset: append ? cycleOffset + 1 : 0,
+          photoFocusMode: mode,
+          skipVideos: true,
+          sceneContext: effectiveScene
+            ? {
+                id: effectiveScene.id,
+                order: effectiveScene.order,
+                title: effectiveScene.title,
+                narrationText: effectiveScene.narrationText,
+                archivalKeywords: effectiveScene.archivalKeywords,
+              }
+            : null,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const imgs: ScenePhotoOption[] = Array.isArray(data?.photoOptions)
+          ? data.photoOptions
+          : [];
+        if (imgs.length > 0) {
+          setPhotoOptions((prev) => {
+            if (!append) return imgs;
+            const seen = new Set(imgs.map((p) => p.dataUrl.slice(0, 120)));
+            const rest = prev.filter((p) => !seen.has((p.dataUrl || '').slice(0, 120)));
+            return [...imgs, ...rest];
+          });
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      setIsLoadingClearFacePhotos(false);
+    }
+  };
+
   useEffect(() => {
     if (isOpen) {
       const initSceneId = scene?.id || activeSceneId || selectableScenes[0]?.id || '';
@@ -777,6 +853,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
       const defaultQuery = cleanCharName;
       setSearchQuery(defaultQuery);
       setFilterTab(initialTab);
+      setPhotoFocusMode('all');
       setSearchDepth('all');
       setVideoSourceSubFilter('all');
       setPreviewUseDirectMp4({});
@@ -1401,26 +1478,47 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     }));
 
   const nonCompositeSoloRegex =
-    /\b(collage|montage|grid|composite|split|diptych|triptych|comparison|before[\s_-]?and[\s_-]?after|then[\s_-]?and[\s_-]?now|mugshot|grave|tombstone|poster|cover|magazine|newspaper|reunion|reuni[aã]o|meeting|ceremony|group|crowd|audience|couple|cast|digital[\s_-]?art|digital[\s_-]?painting|premium[\s_-]?ai|seaart|craiyon|midjourney|ai[\s_-]?art)\b/i;
+    /\b(collage|montage|grid|composite|split|diptych|triptych|comparison|before[\s_-]?and[\s_-]?after|then[\s_-]?and[\s_-]?now|mugshot|grave|tombstone|poster|cover|magazine|newspaper|crowd|audience|digital[\s_-]?art|digital[\s_-]?painting|premium[\s_-]?ai|seaart|craiyon|midjourney|ai[\s_-]?art)\b/i;
 
-  const combinedPhotos = [
-    ...photoOptions,
-    ...vaultPhotoExtras.filter((vp) => !photoOptions.some((po) => po.dataUrl === vp.dataUrl)),
-  ]
-    .filter((p) => {
-      if (nonCompositeSoloRegex.test(p.title || '')) return false;
-      const w = p.width || 720;
-      const h = p.height || 960;
-      if (w / Math.max(1, h) > 1.32) return false;
-      return true;
-    })
-    .sort((a, b) => {
-      const ra = (a.width || 720) / Math.max(1, a.height || 960);
-      const rb = (b.width || 720) / Math.max(1, b.height || 960);
-      const sa = ra >= 0.55 && ra <= 0.95 ? 1 : 0;
-      const sb = rb >= 0.55 && rb <= 0.95 ? 1 : 0;
-      return sb - sa;
-    });
+  const allCleanClearFacePhotos = sortAndBalanceClearFacePhotos(
+    [
+      ...photoOptions,
+      ...vaultPhotoExtras.filter((vp) => !photoOptions.some((po) => po.dataUrl === vp.dataUrl)),
+    ]
+      .filter((p) => {
+        if (nonCompositeSoloRegex.test(p.title || '')) return false;
+        const w = p.width || 720;
+        const h = p.height || 960;
+        // Allow vertical portraits AND classic 4:3 / 3:2 / 35mm clear-face film stills & activity frames (reject 16:9 split banners)
+        if (w / Math.max(1, h) > 1.62) return false;
+        return true;
+      })
+      .map((p) => {
+        const cat =
+          p.photoCategory || classifyClearFacePhotoCategory(p.title, p.sourceUrl || '');
+        return {
+          ...p,
+          photoCategory: cat,
+          photoCategoryLabel: p.photoCategoryLabel || getClearFaceCategoryLabel(cat),
+        };
+      }),
+    photoFocusMode
+  );
+
+  const combinedPhotos =
+    photoFocusMode === 'all'
+      ? allCleanClearFacePhotos
+      : allCleanClearFacePhotos.filter((p) => p.photoCategory === photoFocusMode);
+
+  const filmStillCount = allCleanClearFacePhotos.filter(
+    (p) => p.photoCategory === 'film-still'
+  ).length;
+  const activitySceneCount = allCleanClearFacePhotos.filter(
+    (p) => p.photoCategory === 'activity-scene'
+  ).length;
+  const portraitPhotoCount = allCleanClearFacePhotos.filter(
+    (p) => p.photoCategory === 'portrait'
+  ).length;
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -3986,54 +4084,150 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                 </div>
               )}
 
-              {/* SECTION B: Real Photos (when scene needs an image or Grok/Kling reference photo) */}
+              {/* SECTION B: Clear-Face Movie Stills, Activity Scenes & Portraits for Reg Video */}
               {(filterTab === 'all' || filterTab === 'image') && effectiveScene && (
                 <div className="space-y-3 pt-2 border-t border-slate-800">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h3 className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
                       <ImageIcon className="w-4 h-4 text-emerald-400" />
                       <span>
-                        Chọn Ảnh Đơn Sạch Đẹp Để Vẽ Video (Đã Lọc Bỏ Ảnh Tổng Hợp / Ghép) — Cảnh {sceneNumLabel} ({combinedPhotos.length} ảnh)
+                        Ảnh Nhân Vật Rõ Mặt (Cảnh Phim, Hoạt Động &amp; Chân Dung) Để Reg Video — Cảnh {sceneNumLabel} ({combinedPhotos.length} ảnh)
                       </span>
                     </h3>
+                    <button
+                      type="button"
+                      disabled={isLoadingClearFacePhotos}
+                      onClick={() => fetchClearFacePhotosByMode(photoFocusMode, true)}
+                      className="px-2.5 py-1 rounded-md text-[11px] font-bold bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 flex items-center gap-1.5 transition-colors"
+                    >
+                      {isLoadingClearFacePhotos ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          <span>Đang bổ sung ảnh rõ mặt...</span>
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          <span>+ Bổ Sung Ảnh Cảnh Phim &amp; Hoạt Động Rõ Mặt</span>
+                        </>
+                      )}
+                    </button>
                   </div>
 
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-                    {combinedPhotos.map((photo, idx) => {
-                      const isPortraitRatio = (photo.width || 720) <= (photo.height || 960) * 1.02;
+                  {/* Category Filter Pills for Movie Stills / Real-Life Activities / Portraits */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {(
+                      [
+                        {
+                          id: 'all' as const,
+                          label: `✨ Tất Cả Rõ Mặt (${allCleanClearFacePhotos.length})`,
+                          count: allCleanClearFacePhotos.length,
+                        },
+                        {
+                          id: 'film-still' as const,
+                          label: `🎬 Cảnh Phim Rõ Mặt (${filmStillCount})`,
+                          count: filmStillCount,
+                        },
+                        {
+                          id: 'activity-scene' as const,
+                          label: `🎯 Hoạt Động & Hậu Trường (${activitySceneCount})`,
+                          count: activitySceneCount,
+                        },
+                        {
+                          id: 'portrait' as const,
+                          label: `👤 Chân Dung Cận Mặt (${portraitPhotoCount})`,
+                          count: portraitPhotoCount,
+                        },
+                      ]
+                    ).map((catBtn) => {
+                      const isActive = photoFocusMode === catBtn.id;
                       return (
-                      <div
-                        key={photo.id}
-                        className="rounded-lg bg-[#111827] border border-slate-800 hover:border-emerald-400/70 p-2.5 flex flex-col justify-between gap-2 transition-all"
-                      >
-                        <div className="space-y-1.5">
-                          <div className="relative h-36 rounded overflow-hidden bg-black border border-slate-800">
-                            <img
-                              src={photo.dataUrl}
-                              alt={photo.title}
-                              referrerPolicy="no-referrer"
-                              className="w-full h-full object-cover object-top"
-                            />
-                            <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-600/90 text-white">
-                              Ảnh Đơn #{idx + 1}
-                            </span>
-                            {isPortraitRatio && (
-                              <span className="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-black/80 text-amber-300 border border-amber-400/40">
-                                ✨ Vẽ Video Đẹp
-                              </span>
-                            )}
-                          </div>
-                          <p
-                            className="text-[11px] font-semibold text-slate-200 line-clamp-1"
-                            title={photo.title}
-                          >
-                            {photo.title}
-                          </p>
-                        </div>
+                        <button
+                          key={catBtn.id}
+                          type="button"
+                          onClick={() => {
+                            setPhotoFocusMode(catBtn.id);
+                            if (catBtn.id !== 'all' && catBtn.count < 3) {
+                              fetchClearFacePhotosByMode(catBtn.id, true);
+                            }
+                          }}
+                          className={`px-2.5 py-1 rounded-md text-[11px] font-bold border transition-colors ${
+                            isActive
+                              ? 'bg-emerald-500 text-slate-950 border-emerald-400 shadow-sm'
+                              : 'bg-slate-900 text-slate-300 border-slate-700 hover:border-emerald-400/60'
+                          }`}
+                        >
+                          {catBtn.label}
+                        </button>
+                      );
+                    })}
+                  </div>
 
-                        <div className="space-y-1">
-                          {effectiveScene.sceneType === 'video' ? (
-                            <>
+                  {combinedPhotos.length === 0 ? (
+                    <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-4 text-center space-y-2">
+                      <p className="text-xs text-slate-300">
+                        {isLoadingClearFacePhotos
+                          ? 'Đang tìm ảnh cảnh phim & hoạt động nhìn rõ khuôn mặt nhân vật...'
+                          : 'Chưa có ảnh thuộc nhóm này trong lượt tải hiện tại.'}
+                      </p>
+                      {!isLoadingClearFacePhotos && (
+                        <button
+                          type="button"
+                          onClick={() => fetchClearFacePhotosByMode(photoFocusMode, true)}
+                          className="px-3 py-1.5 rounded-md text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950"
+                        >
+                          🔍 Tìm Ngay Ảnh Rõ Mặt Cho Nhóm Này
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                      {combinedPhotos.map((photo, idx) => {
+                        const cat = photo.photoCategory || 'portrait';
+                        const badgeText =
+                          photo.photoCategoryLabel || getClearFaceCategoryLabel(cat);
+                        const badgeClass =
+                          cat === 'film-still'
+                            ? 'bg-amber-500 text-slate-950'
+                            : cat === 'activity-scene'
+                            ? 'bg-sky-500 text-slate-950'
+                            : 'bg-emerald-500 text-slate-950';
+                        const isDownloadingThis = downloadingPhotoId === photo.id;
+                        return (
+                          <div
+                            key={photo.id}
+                            className="rounded-lg bg-[#111827] border border-slate-800 hover:border-emerald-400/70 p-2.5 flex flex-col justify-between gap-2 transition-all"
+                          >
+                            <div className="space-y-1.5">
+                              <div className="relative h-40 rounded overflow-hidden bg-black border border-slate-800">
+                                <img
+                                  src={photo.dataUrl}
+                                  alt={photo.title}
+                                  referrerPolicy="no-referrer"
+                                  className={`w-full h-full object-cover ${
+                                    (photo.width || 720) > (photo.height || 960) * 1.12
+                                      ? 'object-center'
+                                      : 'object-[50%_22%]'
+                                  }`}
+                                />
+                                <span
+                                  className={`absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[9px] font-extrabold shadow ${badgeClass}`}
+                                >
+                                  {badgeText} #{idx + 1}
+                                </span>
+                                <span className="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-black/80 text-amber-300 border border-amber-400/40">
+                                  {photo.year ? `${photo.year} · ` : ''}✨ Rõ Mặt Reg Video
+                                </span>
+                              </div>
+                              <p
+                                className="text-[11px] font-semibold text-slate-200 line-clamp-1"
+                                title={photo.title}
+                              >
+                                {photo.title}
+                              </p>
+                            </div>
+
+                            <div className="space-y-1">
                               <button
                                 type="button"
                                 onClick={() => {
@@ -4047,50 +4241,57 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                                 className="w-full flex items-center justify-center gap-1 px-2 py-1.5 rounded text-[10px] font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 transition-colors"
                               >
                                 <Sparkles className="w-3 h-3 shrink-0" />
-                                <span className="truncate">Làm Ảnh Gốc + Prompt Grok/Kling</span>
+                                <span className="truncate">Làm Ảnh Gốc + Prompt Reg Video</span>
                               </button>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  onSelectPhotoForScene(
-                                    effectiveScene.id,
-                                    photo,
-                                    'set-as-image-scene'
-                                  );
-                                  onClose();
-                                }}
-                                className="w-full flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 transition-colors"
-                              >
-                                <ImageIcon className="w-3 h-3 shrink-0" />
-                                <span className="truncate">
-                                  Dùng Làm Ảnh Tĩnh Cảnh {sceneNumLabel}
-                                </span>
-                              </button>
-                            </>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                onSelectPhotoForScene(
-                                  effectiveScene.id,
-                                  photo,
-                                  'set-as-image-scene'
-                                );
-                                onClose();
-                              }}
-                              className="w-full flex items-center justify-center gap-1 px-2 py-1.5 rounded text-[11px] font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition-colors"
-                            >
-                              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                              <span className="truncate">
-                                Chọn Ảnh Này Cho Cảnh {sceneNumLabel}
-                              </span>
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                      );
-                    })}
-                  </div>
+                              <div className="grid grid-cols-2 gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    onSelectPhotoForScene(
+                                      effectiveScene.id,
+                                      photo,
+                                      'set-as-image-scene'
+                                    );
+                                    onClose();
+                                  }}
+                                  className="flex items-center justify-center gap-1 px-1.5 py-1 rounded text-[10px] font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 transition-colors"
+                                >
+                                  <ImageIcon className="w-3 h-3 shrink-0" />
+                                  <span className="truncate">Gắn Ảnh Cảnh</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isDownloadingThis}
+                                  onClick={async () => {
+                                    setDownloadingPhotoId(photo.id);
+                                    try {
+                                      await downloadFullFrameImageForGrok(
+                                        photo.dataUrl,
+                                        'image',
+                                        settings.aspectRatio,
+                                        `Canh-${sceneNumLabel || '01'}-${cat}`
+                                      );
+                                    } finally {
+                                      setDownloadingPhotoId(null);
+                                    }
+                                  }}
+                                  className="flex items-center justify-center gap-1 px-1.5 py-1 rounded text-[10px] font-semibold bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/40 transition-colors"
+                                  title="Tải ảnh chuẩn 3:4 HD để đưa thẳng vào Grok / Kling AI reg video"
+                                >
+                                  {isDownloadingThis ? (
+                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                  ) : (
+                                    <Download className="w-3 h-3 shrink-0" />
+                                  )}
+                                  <span className="truncate">Tải 3:4</span>
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               )}
             </>

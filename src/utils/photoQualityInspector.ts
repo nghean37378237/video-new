@@ -159,7 +159,7 @@ export function evaluateCandidateAspectForClearFace(
   // For vertical 3:4 & 9:16 storytelling:
   // Wide 16:9 / 2:1 photos are almost always 2-panel side-by-side collages, group photos, or wide stage shots
   // where center-cropping slices the character's face right off!
-  const maxAllowedAspect = options.allowClassicWideStill ? 1.48 : 1.38;
+  const maxAllowedAspect = options.allowClassicWideStill ? 1.62 : 1.38;
   if (aspect > maxAllowedAspect) {
     return {
       ok: false,

@@ -71,6 +71,11 @@ import {
 } from './utils/videoCutPlanner';
 import { cutVideoInBrowser } from './utils/clientVideoCutter';
 import { cleanCharacterNameForSearch } from './utils/storyStagePhotoPlanner';
+import {
+  buildRegVideoPromptForClearFaceStill,
+  classifyClearFacePhotoCategory,
+  getClearFaceCategoryLabel,
+} from './utils/clearFaceScenePlanner';
 
 export default function App() {
   const [vaultItems, setVaultItems] = useState<VaultItem[]>(() => {
@@ -804,6 +809,18 @@ export default function App() {
         'Will Sampson';
 
       const newSceneType: SceneType = mode === 'keep-video-grok-ref' ? 'video' : 'image';
+      const resolvedCategory =
+        photoOpt.photoCategory || classifyClearFacePhotoCategory(photoOpt.title, photoOpt.sourceUrl || '');
+      const resolvedCatLabel = photoOpt.photoCategoryLabel || getClearFaceCategoryLabel(resolvedCategory);
+      const regVideoPrompt = buildRegVideoPromptForClearFaceStill({
+        characterName: rawTopic,
+        sceneTitle: targetScene.title,
+        narrationText: targetScene.narrationText,
+        photoTitle: photoOpt.title,
+        photoCategory: resolvedCategory,
+        aspectRatio: settings.aspectRatio,
+      });
+
       const klingPack = buildStandardKlingDrawPrompt({
         order: targetScene.order,
         totalScenes: scenes.length,
@@ -811,7 +828,7 @@ export default function App() {
         title: targetScene.title,
         narrationText: targetScene.narrationText,
         rawImagePrompt: targetScene.imagePrompt || targetScene.visualPrompt,
-        rawVideoPrompt: targetScene.videoMotionPrompt,
+        rawVideoPrompt: regVideoPrompt,
         sceneType: newSceneType,
         ratio: settings.aspectRatio,
       });
@@ -829,10 +846,10 @@ export default function App() {
         hasRealPhoto: true,
         realPhotoTitle:
           mode === 'keep-video-grok-ref'
-            ? `${photoOpt.title} (Ảnh Gốc Tạo Video Grok / Kling)`
-            : photoOpt.title,
+            ? `[${resolvedCatLabel}] ${photoOpt.title} (Ảnh Gốc Reg Video)`
+            : `[${resolvedCatLabel}] ${photoOpt.title}`,
         imagePrompt: klingPack.klingImagePrompt,
-        videoMotionPrompt: klingPack.klingVideoPrompt,
+        videoMotionPrompt: regVideoPrompt,
         klingStandardPrompt: klingPack.combinedBlock,
         frameStyle: 'full-bleed',
         showBottomSubtitles: true,
@@ -847,8 +864,8 @@ export default function App() {
 
       setStatusBanner(
         mode === 'keep-video-grok-ref'
-          ? `📸 Đã gắn Ảnh Gốc mới "${photoOpt.title}" + Bộ Prompt Grok/Kling cho Cảnh #${String(targetScene.order).padStart(2, '0')}!`
-          : `🖼️ Đã đổi sang Ảnh Thật "${photoOpt.title}" cho Cảnh #${String(targetScene.order).padStart(2, '0')}!`
+          ? `🎬 Đã gắn Ảnh ${resolvedCatLabel} "${photoOpt.title}" + Prompt Khóa Khuôn Mặt Reg Video (Grok / Kling) cho Cảnh #${String(targetScene.order).padStart(2, '0')}!`
+          : `🖼️ Đã đổi sang Ảnh ${resolvedCatLabel} "${photoOpt.title}" cho Cảnh #${String(targetScene.order).padStart(2, '0')}!`
       );
     }
   };
