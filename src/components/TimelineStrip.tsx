@@ -16,14 +16,18 @@ import {
   Search,
   Play,
   Download,
+  Sparkles,
 } from 'lucide-react';
-import { StoryScene, VaultItem } from '../types';
+import { AspectRatioOption, StoryScene, VaultItem } from '../types';
 import { formatSecLabel } from '../utils/frameExtractor';
+import { auditScenesForUnclearMedia } from '../utils/unclearSceneAudit';
 
 interface TimelineStripProps {
   scenes: StoryScene[];
   vaultItems: VaultItem[];
   activeSceneId: string;
+  aspectRatio?: AspectRatioOption;
+  characterName?: string;
   onSelectScene: (sceneId: string, startSec: number) => void;
   onMoveScene: (sceneId: string, direction: -1 | 1) => void;
   onSwapSceneMedia?: (sceneIdA: string, sceneIdB: string) => void;
@@ -31,6 +35,7 @@ interface TimelineStripProps {
   onUpdateScene?: (sceneId: string, patch: Partial<StoryScene>) => void;
   currentTimeSec: number;
   onOpenPromptStudio: () => void;
+  onOpenUnclearScenesStudio?: () => void;
   onUploadFileForScene?: (sceneId: string, file: File) => void;
   onSmartBatchUploadFiles?: (files: FileList) => void;
   onFetchAndInsertTrimmedActorVideos?: (
@@ -51,6 +56,8 @@ export const TimelineStrip: React.FC<TimelineStripProps> = ({
   scenes,
   vaultItems,
   activeSceneId,
+  aspectRatio = '3:4',
+  characterName = '',
   onSelectScene,
   onMoveScene,
   onSwapSceneMedia,
@@ -58,6 +65,7 @@ export const TimelineStrip: React.FC<TimelineStripProps> = ({
   onUpdateScene,
   currentTimeSec,
   onOpenPromptStudio,
+  onOpenUnclearScenesStudio,
   onUploadFileForScene,
   onSmartBatchUploadFiles,
   onFetchAndInsertTrimmedActorVideos,
@@ -69,6 +77,14 @@ export const TimelineStrip: React.FC<TimelineStripProps> = ({
   const [dragOverSceneId, setDragOverSceneId] = useState<string | null>(null);
   const [swapSourceSceneId, setSwapSourceSceneId] = useState<string | null>(null);
   let runningSec = 0;
+
+  const unclearAudits = auditScenesForUnclearMedia(
+    scenes,
+    vaultItems,
+    aspectRatio,
+    characterName
+  );
+  const unclearSceneCount = Object.values(unclearAudits).filter((a) => a.isUnclear).length;
 
   const swapSourceIdx = swapSourceSceneId
     ? scenes.findIndex((s) => s.id === swapSourceSceneId)
@@ -146,6 +162,20 @@ export const TimelineStrip: React.FC<TimelineStripProps> = ({
               <ArrowLeftRight className="w-3.5 h-3.5" />
               <span>
                 Đang chọn đảo Cảnh #{String(swapSourceIdx + 1).padStart(2, '0')} (Bấm cảnh đích hoặc Hủy)
+              </span>
+            </button>
+          )}
+
+          {onOpenUnclearScenesStudio && (
+            <button
+              type="button"
+              onClick={onOpenUnclearScenesStudio}
+              title={`Lọc ${unclearSceneCount} cảnh chưa rõ / thiếu video thật / ảnh chưa nét HD — làm nét ảnh 1080×1440 hàng loạt và copy trọn bộ Prompt vẽ Video (Kling AI / Grok)`}
+              className="flex items-center gap-1 px-2.5 py-0.5 rounded bg-amber-500 hover:bg-amber-400 text-slate-950 border border-amber-300 font-sans font-bold shadow-sm transition-colors whitespace-nowrap shrink-0"
+            >
+              <Sparkles className="w-3.5 h-3.5 shrink-0" />
+              <span>
+                ✨ {unclearSceneCount} Cảnh Không Rõ → Ảnh Nét &amp; Prompt Vẽ Video
               </span>
             </button>
           )}
@@ -597,14 +627,18 @@ export const TimelineStrip: React.FC<TimelineStripProps> = ({
                     )}
                     <span
                       className={`absolute bottom-0 right-0 px-1 text-[8px] font-bold uppercase leading-tight ${
-                        isMissingRealPhoto
+                        scene.isCrispHd
+                          ? 'bg-emerald-500 text-slate-950'
+                          : isMissingRealPhoto
                           ? 'bg-amber-500 text-slate-950'
                           : isVideoSceneHoldingTempImage
                           ? 'bg-amber-500 text-slate-950'
                           : 'bg-emerald-600 text-white'
                       }`}
                     >
-                      {isMissingRealPhoto
+                      {scene.isCrispHd
+                        ? 'HD NÉT'
+                        : isMissingRealPhoto
                         ? 'KLING'
                         : isVideoSceneHoldingTempImage
                         ? 'ẢNH GỐC'

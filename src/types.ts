@@ -80,6 +80,12 @@ export interface StoryScene {
   klingStandardPrompt?: string;
   /** Primary verified real portrait URL of the character to use as a downloadable face reference when drawing or generating video on Kling AI for scenes that lack their own unique archival photo */
   characterRefPhotoUrl?: string;
+  /** True once the scene's image/reference frame has been enhanced or drawn to crisp full-frame HD resolution */
+  isCrispHd?: boolean;
+  /** Dimensions label of the crisp HD photo (e.g. '1080×1440') */
+  crispHdDimensions?: string;
+  /** Optional manual override: true = force include in unclear/redraw list, false = user marked clear */
+  unclearFlagOverride?: boolean;
 }
 
 export type TransitionStyle =

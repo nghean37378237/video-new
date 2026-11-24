@@ -46,6 +46,10 @@ import {
   cleanCharacterNameForSearch,
 } from '../utils/storyStagePhotoPlanner';
 import {
+  auditScenesForUnclearMedia,
+  buildUnclearSceneVideoPromptPack,
+} from '../utils/unclearSceneAudit';
+import {
   analyzeVoiceCloneDNAFromAudioFile,
   BG_MUSIC_STYLE_LABELS,
   loadActiveVoiceCloneDNA,
@@ -85,8 +89,11 @@ interface SceneInspectorProps {
   isGeneratingAllTTS: boolean;
   ttsProgressText: string;
   onOpenPromptStudio: () => void;
+  onOpenUnclearScenesStudio?: () => void;
   onGenerateImageViaProxyForScene?: (scene: StoryScene) => Promise<void>;
   generatingImageSceneId?: string | null;
+  onEnhanceCrispPhotoForScene?: (scene: StoryScene) => Promise<boolean>;
+  enhancingCrispSceneId?: string | null;
   onUploadFileForScene?: (sceneId: string, file: File) => void;
   onTriggerExport?: () => void;
   onFetchAndInsertTrimmedActorVideos?: (
@@ -111,8 +118,11 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
   isGeneratingAllTTS,
   ttsProgressText,
   onOpenPromptStudio,
+  onOpenUnclearScenesStudio,
   onGenerateImageViaProxyForScene,
   generatingImageSceneId,
+  onEnhanceCrispPhotoForScene,
+  enhancingCrispSceneId,
   onUploadFileForScene,
   onTriggerExport,
   onFetchAndInsertTrimmedActorVideos,
@@ -198,7 +208,11 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
   const ratioSpec = getAspectRatioSpec(settings.aspectRatio);
 
   const copyPrompt = (text: string, field: string) => {
-    navigator.clipboard.writeText(text);
+    try {
+      navigator.clipboard?.writeText(text)?.catch(() => {});
+    } catch {
+      // Clipboard API may be unavailable in restricted contexts
+    }
     setCopiedField(field);
     setTimeout(() => setCopiedField(null), 1800);
   };
@@ -722,6 +736,130 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
                   </span>
                 </div>
               )}
+
+              {/* Crisp HD Enhancement & Unclear-Scene Video Drawing Prompt Card */}
+              {(() => {
+                const allAudits = auditScenesForUnclearMedia(
+                  scenes,
+                  vaultItems,
+                  settings.aspectRatio,
+                  settings.projectTitle
+                );
+                const sceneAudit = allAudits[activeScene.id];
+                const totalUnclearCount = Object.values(allAudits).filter((a) => a.isUnclear).length;
+                if (!sceneAudit || !sceneAudit.isVisualScene) return null;
+                const sceneIdx = scenes.findIndex((s) => s.id === activeScene.id);
+                const crispPack = buildUnclearSceneVideoPromptPack({
+                  scene: activeScene,
+                  index: sceneIdx >= 0 ? sceneIdx : 0,
+                  totalScenes: scenes.length,
+                  characterName: settings.projectTitle,
+                  aspectRatio: settings.aspectRatio,
+                  audit: sceneAudit,
+                });
+
+                return (
+                  <div
+                    className={`rounded-lg border p-2.5 space-y-2 ${
+                      sceneAudit.isCrispHdReady
+                        ? 'bg-emerald-950/30 border-emerald-500/40'
+                        : sceneAudit.isUnclear
+                        ? 'bg-amber-950/30 border-amber-500/45'
+                        : 'bg-slate-900/70 border-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-1.5">
+                      <span className="text-[11px] font-bold text-amber-300 flex items-center gap-1">
+                        <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        {sceneAudit.isCrispHdReady
+                          ? `✨ Ảnh Nét HD (${activeScene.crispHdDimensions || `${ratioSpec.width}×${ratioSpec.height}`})`
+                          : sceneAudit.isUnclear
+                          ? '⚠️ Cảnh Chưa Rõ — Lấy Ảnh Nét & Prompt Vẽ Video'
+                          : '✅ Cảnh Đã Đạt Chuẩn'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onUpdateScene(activeScene.id, {
+                            unclearFlagOverride: sceneAudit.isUnclear ? false : true,
+                          })
+                        }
+                        className="px-1.5 py-0.5 text-[10px] font-semibold rounded border border-slate-700 bg-slate-900 hover:border-amber-400 text-slate-300 hover:text-amber-200 transition-colors shrink-0"
+                      >
+                        {sceneAudit.isUnclear ? 'Bỏ đánh dấu' : '+ Đánh dấu mờ'}
+                      </button>
+                    </div>
+
+                    {sceneAudit.reasons.length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {sceneAudit.reasons.map((r) => (
+                          <span
+                            key={r.code}
+                            title={r.detailVi}
+                            className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/15 text-amber-200 border border-amber-500/35"
+                          >
+                            {r.labelVi}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {onEnhanceCrispPhotoForScene && (
+                        <button
+                          type="button"
+                          onClick={() => onEnhanceCrispPhotoForScene(activeScene)}
+                          disabled={enhancingCrispSceneId === activeScene.id}
+                          className="flex items-center justify-center gap-1 px-2 py-1.5 text-[11px] font-bold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 rounded-md transition-colors"
+                        >
+                          {enhancingCrispSceneId === activeScene.id ? (
+                            <>
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                              Đang làm nét...
+                            </>
+                          ) : (
+                            <>
+                              <Sparkles className="w-3 h-3" />
+                              Làm Nét HD ({ratioSpec.width}×{ratioSpec.height})
+                            </>
+                          )}
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          copyPrompt(crispPack.combinedCopyBlock, 'crisp-video-pack')
+                        }
+                        className="flex items-center justify-center gap-1 px-2 py-1.5 text-[11px] font-bold bg-sky-500/20 hover:bg-sky-500/30 text-sky-200 border border-sky-400/50 rounded-md transition-colors"
+                      >
+                        {copiedField === 'crisp-video-pack' ? (
+                          <>
+                            <Check className="w-3 h-3 text-emerald-400" />
+                            Đã Copy Prompt!
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                            Copy Prompt Vẽ Video
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    {onOpenUnclearScenesStudio && totalUnclearCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={onOpenUnclearScenesStudio}
+                        className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-[11px] font-bold bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-400/50 rounded-md transition-colors"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        Mở Trọn Bộ {totalUnclearCount} Cảnh Không Rõ (Làm Nét Hàng Loạt &amp; Copy Prompt)
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
 
               {(stagePhotoOptionsByScene[activeScene.id]?.length ?? 0) > 1 && (
                 <div className="space-y-1.5 rounded-md bg-slate-900/80 border border-slate-800 p-2">

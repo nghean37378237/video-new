@@ -64,6 +64,7 @@ import {
   captureRealVideoFrameThumbnail,
   fetchAndAutoTrimActorRealVideos,
 } from './utils/realActorVideoTrimmer';
+import { cleanCharacterNameForSearch } from './utils/storyStagePhotoPlanner';
 
 export default function App() {
   const [vaultItems, setVaultItems] = useState<VaultItem[]>(() => {
@@ -131,6 +132,10 @@ export default function App() {
   const [triggerExportCounter, setTriggerExportCounter] = useState<number>(0);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
   const [isPromptStudioOpen, setIsPromptStudioOpen] = useState<boolean>(false);
+  const [promptStudioInitialFilter, setPromptStudioInitialFilter] = useState<
+    'all' | 'unclear-hd' | 'missing-photo' | 'has-photo'
+  >('all');
+  const [enhancingCrispSceneId, setEnhancingCrispSceneId] = useState<string | null>(null);
   const [proxyBaseUrl, setProxyBaseUrl] = useState<string>('https://chat.trollllm.xyz/v1');
   const [proxyModel, setProxyModel] = useState<string>('claude-sonnet-4-6');
   const [generatingImageSceneId, setGeneratingImageSceneId] = useState<string | null>(null);
@@ -3219,18 +3224,219 @@ export default function App() {
         mediaId: newItem.id,
         mediaUrl: newItem.url,
         mediaKind: 'image',
+        characterRefPhotoUrl: newItem.url,
         hasRealPhoto: true,
+        isCrispHd: true,
+        crispHdDimensions:
+          settings.aspectRatio === '16:9'
+            ? '1920×1080'
+            : settings.aspectRatio === '9:16'
+            ? '1080×1920'
+            : '1080×1440',
         realPhotoTitle: newItem.name,
         frameStyle: 'full-bleed',
         showBottomSubtitles: true,
       });
       setStatusBanner(
-        `Đã vẽ xong Ảnh Gốc Full Khung (${settings.aspectRatio}) cho Cảnh #${scene.order}! Bạn có thể bấm tải ảnh này về đưa qua Kling AI (Image-to-Video) tạo Video.`
+        `Đã vẽ xong Ảnh Nét HD Full Khung (${settings.aspectRatio}) cho Cảnh #${scene.order}! Bạn có thể tải ảnh này đưa qua Kling AI / Grok tạo Video.`
       );
     } catch (err: any) {
       setStatusBanner(err?.message || 'Lỗi khi vẽ ảnh Full Khung.');
     } finally {
       setGeneratingImageSceneId(null);
+    }
+  };
+
+  // Enhance an unclear/low-res photo (or extract & sharpen a frame from a video) into a crisp Full-Frame HD photo (1080x1440 / 1080x1920 / 1920x1080)
+  // If the scene has no media yet (or its source fails), automatically fetches a real stage-matched character photo first and restores it to crisp HD!
+  const handleEnhanceCrispPhotoForScene = async (scene: StoryScene): Promise<boolean> => {
+    if (enhancingCrispSceneId) return false;
+    setEnhancingCrispSceneId(scene.id);
+
+    const fetchFreshArchivalPhotoForScene = async (): Promise<{
+      dataUrl: string;
+      title?: string;
+    } | null> => {
+      try {
+        const savedPrefs = loadSavedAudioPreferences();
+        const cleanCharName =
+          cleanCharacterNameForSearch(savedPrefs.storyTopic || settings.projectTitle) ||
+          settings.projectTitle ||
+          'Will Sampson';
+        const usedUrls = scenes
+          .filter((s) => s.id !== scene.id)
+          .flatMap((s) => [s.mediaUrl, s.characterRefPhotoUrl])
+          .filter((u): u is string => Boolean(u && !u.startsWith('data:image/jpeg;base64,/9j/')));
+
+        const matchRes = await fetch('/api/archival/match-scenes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            topic: cleanCharName,
+            storyMode: settings.storyMode || 'biography',
+            skipVideoCuts: true,
+            excludeUrls: usedUrls.slice(0, 24),
+            scenes: [
+              {
+                id: scene.id,
+                order: scene.order,
+                title: scene.title,
+                sceneType: scene.sceneType,
+                narrationText: scene.narrationText,
+                archivalKeywords: scene.archivalKeywords || scene.title,
+                visualPrompt: scene.visualPrompt,
+              },
+            ],
+          }),
+        });
+        if (!matchRes.ok) return null;
+        const matchData = await safeParseJsonResponse(matchRes);
+        const stageCandidates = Array.isArray(matchData?.stageCandidatesBySceneId?.[scene.id])
+          ? matchData.stageCandidatesBySceneId[scene.id]
+          : Array.isArray(matchData?.allPhotos)
+          ? matchData.allPhotos.filter((p: any) => p.mediaKind !== 'video' && p.dataUrl)
+          : [];
+        const matched =
+          matchData?.matchedBySceneId?.[scene.id] ||
+          matchData?.referenceBySceneId?.[scene.id] ||
+          stageCandidates[0];
+        if (matched?.dataUrl) {
+          return {
+            dataUrl: matched.dataUrl,
+            title: matched.stageLabel
+              ? `[${matched.stageLabel}] ${matched.title || ''}`.trim()
+              : matched.title,
+          };
+        }
+      } catch {
+        // Ignore archival fetch error and let caller handle fallback
+      }
+      return null;
+    };
+
+    const callEnhanceApi = async (url: string, kind: 'image' | 'video') => {
+      const res = await fetch('/api/media/enhance-crisp-photo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageUrl: url,
+          mediaKind: kind,
+          aspectRatio: settings.aspectRatio,
+          trimStartSec: scene.videoTrimStartSec || 0,
+        }),
+      });
+      const data = await safeParseJsonResponse(res);
+      if (!res.ok || !data?.imageDataUrl) {
+        return null;
+      }
+      return data;
+    };
+
+    try {
+      const assignedItem = vaultItems.find((v) => v.id === scene.mediaId);
+      let sourceUrl: string | undefined =
+        assignedItem?.url || scene.mediaUrl || scene.characterRefPhotoUrl;
+      let sourceKind: 'image' | 'video' =
+        assignedItem?.type === 'video' || scene.mediaKind === 'video' ? 'video' : 'image';
+      let matchedPhotoTitle: string | undefined = scene.realPhotoTitle;
+
+      // If this scene is currently empty (no image/video yet), auto-fetch a real archival photo first
+      if (!sourceUrl) {
+        setStatusBanner(
+          `Đang tự tìm ảnh nhân vật cho Cảnh #${String(scene.order).padStart(2, '0')} & làm nét HD...`
+        );
+        const fetched = await fetchFreshArchivalPhotoForScene();
+        if (fetched?.dataUrl) {
+          sourceUrl = fetched.dataUrl;
+          sourceKind = 'image';
+          matchedPhotoTitle = fetched.title || matchedPhotoTitle;
+        } else {
+          const fallbackCharPhoto =
+            scenes.find((s) => s.characterRefPhotoUrl)?.characterRefPhotoUrl ||
+            vaultItems.find((v) => v.type === 'image' && v.url)?.url;
+          if (fallbackCharPhoto) {
+            sourceUrl = fallbackCharPhoto;
+            sourceKind = 'image';
+          }
+        }
+      }
+
+      if (!sourceUrl) {
+        setStatusBanner(
+          `Không tìm được ảnh nguồn cho Cảnh #${scene.order}. Hãy bấm "Vẽ Lại Bằng AI" hoặc tải ảnh lên!`
+        );
+        return false;
+      }
+
+      let data = await callEnhanceApi(sourceUrl, sourceKind);
+
+      // If the existing source failed (e.g. broken remote URL or missing local video), fetch a fresh archival photo and enhance it!
+      if (!data) {
+        const fetched = await fetchFreshArchivalPhotoForScene();
+        if (fetched?.dataUrl) {
+          sourceUrl = fetched.dataUrl;
+          sourceKind = 'image';
+          matchedPhotoTitle = fetched.title || matchedPhotoTitle;
+          data = await callEnhanceApi(sourceUrl, 'image');
+        }
+      }
+
+      if (!data?.imageDataUrl) {
+        throw new Error(`Không thể làm nét HD cho Cảnh #${scene.order}.`);
+      }
+
+      const dimLabel: string =
+        data.dimensionsLabel ||
+        (settings.aspectRatio === '16:9'
+          ? '1920×1080'
+          : settings.aspectRatio === '9:16'
+          ? '1080×1920'
+          : '1080×1440');
+
+      const crispItem: VaultItem = {
+        id: `crisp-hd-${scene.id}-${Date.now()}`,
+        name: `✨ Ảnh Nét HD (${dimLabel}) Cảnh #${String(scene.order).padStart(2, '0')} — ${(matchedPhotoTitle || scene.title).slice(0, 26)}`,
+        type: 'image',
+        url: data.imageDataUrl,
+        thumbnailUrl: data.imageDataUrl,
+        width: Number(data.width) || 1080,
+        height: Number(data.height) || 1440,
+        durationSec: scene.durationSec || 7,
+        sourceTag: 'uploaded',
+        createdAt: `HD Nét ${dimLabel}`,
+      };
+
+      setVaultItems((prev) => [crispItem, ...prev]);
+
+      // Keep attached real MP4 video if the scene already had a valid video; otherwise upgrade the scene's display image to the crisp HD version!
+      const keepExistingRealVideo =
+        sourceKind === 'video' && Boolean(scene.mediaUrl) && scene.mediaKind === 'video';
+      handleUpdateScene(scene.id, {
+        ...(keepExistingRealVideo
+          ? {}
+          : {
+              mediaId: crispItem.id,
+              mediaUrl: crispItem.url,
+              mediaKind: 'image',
+              realPhotoTitle: crispItem.name,
+            }),
+        characterRefPhotoUrl: crispItem.url,
+        hasRealPhoto: true,
+        isCrispHd: true,
+        crispHdDimensions: dimLabel,
+        frameStyle: 'full-bleed',
+        showBottomSubtitles: true,
+      });
+
+      setStatusBanner(
+        `✨ Đã tạo & làm nét xong Ảnh HD ${dimLabel} cho Cảnh #${String(scene.order).padStart(2, '0')}! Bạn có thể tải ảnh nét này kèm Prompt vẽ Video ngay.`
+      );
+      return true;
+    } catch (err: any) {
+      setStatusBanner(err?.message || 'Lỗi khi làm nét ảnh HD.');
+      return false;
+    } finally {
+      setEnhancingCrispSceneId(null);
     }
   };
 
@@ -3617,9 +3823,18 @@ export default function App() {
             onGenerateAllVoiceovers={handleGenerateAllVoiceovers}
             isGeneratingAllTTS={isGeneratingAllTTS}
             ttsProgressText={ttsProgressText}
-            onOpenPromptStudio={() => setIsPromptStudioOpen(true)}
+            onOpenPromptStudio={() => {
+              setPromptStudioInitialFilter('all');
+              setIsPromptStudioOpen(true);
+            }}
+            onOpenUnclearScenesStudio={() => {
+              setPromptStudioInitialFilter('unclear-hd');
+              setIsPromptStudioOpen(true);
+            }}
             onGenerateImageViaProxyForScene={handleGenerateImageViaProxyForScene}
             generatingImageSceneId={generatingImageSceneId}
+            onEnhanceCrispPhotoForScene={handleEnhanceCrispPhotoForScene}
+            enhancingCrispSceneId={enhancingCrispSceneId}
             onUploadFileForScene={handleUploadFileForScene}
             onTriggerExport={() => setTriggerExportCounter((c) => c + 1)}
             onFetchAndInsertTrimmedActorVideos={handleFetchAndInsertTrimmedActorVideos}
@@ -3634,6 +3849,8 @@ export default function App() {
         scenes={scenes}
         vaultItems={vaultItems}
         activeSceneId={activeSceneId}
+        aspectRatio={settings.aspectRatio}
+        characterName={settings.projectTitle}
         onSelectScene={(id, startSec) => {
           setActiveSceneId(id);
           setCurrentTimeSec(startSec + 0.05);
@@ -3643,7 +3860,14 @@ export default function App() {
         onBatchSwapVideoImageMedia={handleBatchSwapVideoImageMedia}
         onUpdateScene={handleUpdateScene}
         currentTimeSec={currentTimeSec}
-        onOpenPromptStudio={() => setIsPromptStudioOpen(true)}
+        onOpenPromptStudio={() => {
+          setPromptStudioInitialFilter('all');
+          setIsPromptStudioOpen(true);
+        }}
+        onOpenUnclearScenesStudio={() => {
+          setPromptStudioInitialFilter('unclear-hd');
+          setIsPromptStudioOpen(true);
+        }}
         onUploadFileForScene={handleUploadFileForScene}
         onSmartBatchUploadFiles={handleSmartBatchUploadFiles}
         onFetchAndInsertTrimmedActorVideos={handleFetchAndInsertTrimmedActorVideos}
@@ -3699,6 +3923,7 @@ export default function App() {
       {/* Full Script Breakdown, Prompt Generator & Intermediary Proxy API Studio Modal */}
       <ScriptPromptStudioModal
         isOpen={isPromptStudioOpen}
+        initialSceneFilter={promptStudioInitialFilter}
         onClose={() => setIsPromptStudioOpen(false)}
         scenes={scenes}
         vaultItems={vaultItems}
@@ -3720,6 +3945,8 @@ export default function App() {
         onChangeProxyModel={setProxyModel}
         onGenerateImageViaProxyForScene={handleGenerateImageViaProxyForScene}
         generatingImageSceneId={generatingImageSceneId}
+        onEnhanceCrispPhotoForScene={handleEnhanceCrispPhotoForScene}
+        enhancingCrispSceneId={enhancingCrispSceneId}
         onOpenSceneMediaSearch={(sceneId) => setSearchingMediaSceneId(sceneId)}
         onQuickCycleSceneMedia={handleQuickCycleSceneMedia}
       />

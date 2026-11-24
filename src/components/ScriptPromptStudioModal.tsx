@@ -45,9 +45,15 @@ import {
   saveAudioPreferences,
   VOICE_SHORT_LABELS,
 } from '../utils/voiceConsistencyEngine';
+import {
+  auditScenesForUnclearMedia,
+  buildBatchUnclearPromptsDocument,
+  buildUnclearSceneVideoPromptPack,
+} from '../utils/unclearSceneAudit';
 
 interface ScriptPromptStudioModalProps {
   isOpen: boolean;
+  initialSceneFilter?: 'all' | 'unclear-hd' | 'missing-photo' | 'has-photo';
   onClose: () => void;
   scenes: StoryScene[];
   vaultItems: VaultItem[];
@@ -78,12 +84,15 @@ interface ScriptPromptStudioModalProps {
   onChangeProxyModel: (model: string) => void;
   onGenerateImageViaProxyForScene: (scene: StoryScene) => Promise<void>;
   generatingImageSceneId: string | null;
+  onEnhanceCrispPhotoForScene?: (scene: StoryScene) => Promise<boolean>;
+  enhancingCrispSceneId?: string | null;
   onOpenSceneMediaSearch?: (sceneId: string) => void;
   onQuickCycleSceneMedia?: (sceneId: string) => void;
 }
 
 export const ScriptPromptStudioModal: React.FC<ScriptPromptStudioModalProps> = ({
   isOpen,
+  initialSceneFilter = 'all',
   onClose,
   scenes,
   vaultItems,
@@ -105,13 +114,17 @@ export const ScriptPromptStudioModal: React.FC<ScriptPromptStudioModalProps> = (
   onChangeProxyModel,
   onGenerateImageViaProxyForScene,
   generatingImageSceneId,
+  onEnhanceCrispPhotoForScene,
+  enhancingCrispSceneId,
   onOpenSceneMediaSearch,
   onQuickCycleSceneMedia,
 }) => {
   const [activeTab, setActiveTab] = useState<
     'checklist' | 'proxy-api' | 'chatgpt-bridge' | 'paste-script'
   >('checklist');
-  const [sceneFilter, setSceneFilter] = useState<'all' | 'missing-photo' | 'has-photo'>('all');
+  const [sceneFilter, setSceneFilter] = useState<
+    'all' | 'unclear-hd' | 'missing-photo' | 'has-photo'
+  >(initialSceneFilter);
   const [rawScriptInput, setRawScriptInput] = useState(
     `A circus performer. A nightclub singer. A king. A gunfighter. Yul Brynner lived more lives than most men could ever dream of.\n\nThe shaved head, the piercing eyes, that slow confident walk. He didn't need to raise his voice. He just stood there, and the scene was his.\n\nBut his story didn't begin in Hollywood. It began far away, in Vladivostok, Russia, on July eleventh, nineteen twenty.\n\nAs a boy, he moved to China, then to France. New countries, new languages, and a restless young heart that never stood still.`
   );
@@ -152,12 +165,18 @@ export const ScriptPromptStudioModal: React.FC<ScriptPromptStudioModalProps> = (
   } | null>(null);
   const [isBatchGeneratingImages, setIsBatchGeneratingImages] = useState<boolean>(false);
   const [batchImageProgress, setBatchImageProgress] = useState<string>('');
+  const [isBatchEnhancingCrisp, setIsBatchEnhancingCrisp] = useState<boolean>(false);
+  const [batchCrispProgress, setBatchCrispProgress] = useState<string>('');
 
   const sceneFileInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const batchFileInputRef = useRef<Record<string, HTMLInputElement | null> | any>(null);
 
   useEffect(() => {
     if (!isOpen) return;
+    if (initialSceneFilter) {
+      setSceneFilter(initialSceneFilter);
+      setActiveTab('checklist');
+    }
     fetch('/api/proxy/status')
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
@@ -167,12 +186,16 @@ export const ScriptPromptStudioModal: React.FC<ScriptPromptStudioModalProps> = (
         if (data.model && !proxyModel) onChangeProxyModel(data.model);
       })
       .catch(() => {});
-  }, [isOpen]);
+  }, [isOpen, initialSceneFilter]);
 
   if (!isOpen) return null;
 
   const copyToClipboard = (text: string, key: string) => {
-    navigator.clipboard.writeText(text);
+    try {
+      navigator.clipboard?.writeText(text)?.catch(() => {});
+    } catch {
+      // Clipboard API may be unavailable in restricted contexts
+    }
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), 2000);
   };
@@ -413,39 +436,100 @@ QUY TẮC TỶ LỆ VIDEO (>1/2 ĐỘ DÀI TOÀN VIDEO) & KỊCH BẢN CHUYỂN 
     scenes.find((s) => s.characterRefPhotoUrl)?.characterRefPhotoUrl ||
     verifiedRealPhotoScenes.find((s) => s.mediaKind !== 'video' && s.mediaUrl)?.mediaUrl;
 
+  const activeCharacterTitle =
+    settings?.projectTitle || scriptCharacterHint || chatGptCharacter || 'Nhân vật';
+  const unclearAuditsById = auditScenesForUnclearMedia(
+    scenes,
+    vaultItems,
+    aspectRatio,
+    activeCharacterTitle
+  );
+  const unclearScenesList = visualScenesList.filter(
+    (s) => unclearAuditsById[s.id]?.isUnclear
+  );
+  const unclearNeedsHdCount = unclearScenesList.filter(
+    (s) => !unclearAuditsById[s.id]?.isCrispHdReady
+  ).length;
+
+  const copyUnclearScenesVideoPrompts = () => {
+    const targetList = unclearScenesList.length > 0 ? unclearScenesList : visualScenesList;
+    const doc = buildBatchUnclearPromptsDocument(
+      targetList,
+      scenes,
+      unclearAuditsById,
+      activeCharacterTitle,
+      aspectRatio
+    );
+    copyToClipboard(doc, 'copy-unclear-batch-prompts');
+  };
+
+  const downloadUnclearScenesPromptsTxt = () => {
+    const targetList = unclearScenesList.length > 0 ? unclearScenesList : visualScenesList;
+    const doc = buildBatchUnclearPromptsDocument(
+      targetList,
+      scenes,
+      unclearAuditsById,
+      activeCharacterTitle,
+      aspectRatio
+    );
+    const blob = new Blob([doc], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Prompt-Ve-Video-${targetList.length}-Canh-Khong-Ro.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  };
+
+  const handleBatchEnhanceUnclearCrispPhotos = async () => {
+    if (isBatchEnhancingCrisp || !onEnhanceCrispPhotoForScene) return;
+    const baseTargets = unclearScenesList.length > 0 ? unclearScenesList : visualScenesList;
+    const notYetHd = baseTargets.filter((s) => !s.isCrispHd);
+    const targets = notYetHd.length > 0 ? notYetHd : baseTargets;
+    if (targets.length === 0) return;
+
+    setIsBatchEnhancingCrisp(true);
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        const sc = targets[i];
+        setBatchCrispProgress(
+          `Đang làm nét HD Cảnh #${String(sc.order).padStart(2, '0')} (${i + 1}/${targets.length})...`
+        );
+        await onEnhanceCrispPhotoForScene(sc);
+      }
+    } finally {
+      setIsBatchEnhancingCrisp(false);
+      setBatchCrispProgress('');
+    }
+  };
+
   const copyMissingRealPhotoKlingPrompts = () => {
     const targetList =
-      missingRealPhotoScenes.length > 0 ? missingRealPhotoScenes : visualScenesList;
-    const header =
-      `DANH SÁCH PROMPT CHUẨN KLING AI THEO THỨ TỰ MƯỢT MÀ (#01 -> #${String(scenes.length).padStart(2, '0')})\n` +
-      `(Dành cho ${targetList.length} phân cảnh chưa có ảnh thật trên mạng — tuyệt đối không lấy ảnh lung tung, bạn chỉ cần copy Prompt chuẩn bên dưới để vẽ Ảnh/Video trên Kling AI hoặc ChatGPT Pro):\n\n`;
-
-    const body = targetList
-      .map((sc) => {
-        if (sc.klingStandardPrompt) return sc.klingStandardPrompt;
-        const pack = buildStandardKlingDrawPrompt({
-          order: sc.order,
-          totalScenes: scenes.length,
-          characterName: scriptCharacterHint || chatGptCharacter || sc.title,
-          title: sc.title,
-          narrationText: sc.narrationText,
-          rawImagePrompt: sc.imagePrompt || sc.visualPrompt,
-          rawVideoPrompt: sc.videoMotionPrompt,
-          sceneType: sc.sceneType,
-          ratio: aspectRatio,
-        });
-        return pack.combinedBlock;
-      })
-      .join('\n\n==================================================\n\n');
-
-    copyToClipboard(header + body, 'copy-missing-kling');
+      unclearScenesList.length > 0
+        ? unclearScenesList
+        : missingRealPhotoScenes.length > 0
+        ? missingRealPhotoScenes
+        : visualScenesList;
+    const doc = buildBatchUnclearPromptsDocument(
+      targetList,
+      scenes,
+      unclearAuditsById,
+      activeCharacterTitle,
+      aspectRatio
+    );
+    copyToClipboard(doc, 'copy-missing-kling');
   };
 
   const handleBatchGenerateAllImages = async () => {
     if (isBatchGeneratingImages) return;
-    // Prefer drawing only scenes that are missing real photos first, or all visual scenes if all already have photos
     const targetScenes =
-      missingRealPhotoScenes.length > 0 ? missingRealPhotoScenes : visualScenesList;
+      missingRealPhotoScenes.length > 0
+        ? missingRealPhotoScenes
+        : unclearScenesList.length > 0
+        ? unclearScenesList
+        : visualScenesList;
     if (targetScenes.length === 0) return;
 
     setIsBatchGeneratingImages(true);
@@ -833,78 +917,110 @@ QUY TẮC TỶ LỆ VIDEO (>1/2 ĐỘ DÀI TOÀN VIDEO) & KỊCH BẢN CHUYỂN 
         {/* Tab 2: Scene-by-Scene Production Sheet */}
         {activeTab === 'checklist' && (
           <div className="flex-1 overflow-y-auto p-6 space-y-4">
-            <div className="p-3.5 rounded-xl bg-slate-900/90 border border-amber-500/30 space-y-3">
+            <div className="p-3.5 rounded-xl bg-slate-900/90 border border-amber-500/35 space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="space-y-0.5">
                   <p className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
-                    <Maximize2 className="w-3.5 h-3.5 text-amber-400" />
-                    Chế Độ Lọc Ảnh Thật Nghiêm Ngặt & Prompt Chuẩn Kling AI Theo Thứ Tự Mượt Mà (#01 → #{String(scenes.length).padStart(2, '0')}):
+                    <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                    Trạm Làm Nét Ảnh HD ({ratioSpec.width}×{ratioSpec.height}px) &amp; Trọn Bộ Prompt Vẽ Video Cho {unclearScenesList.length} Cảnh Không Rõ Ràng:
                   </p>
                   <p className="text-xs text-slate-300">
-                    Đoạn nào tìm được <strong>Ảnh Thật chuẩn đúng tên nhân vật</strong> sẽ gắn nhãn xanh <strong className="text-emerald-300">📸 Ảnh Thật Chuẩn</strong>. Đoạn nào trên mạng không có ảnh thật, App <strong>tuyệt đối không lấy ảnh lung tung</strong> mà tạo sẵn <strong className="text-amber-300">🎨 Prompt Chuẩn Kling AI</strong> theo đúng thứ tự thời gian để bạn copy vẽ!
+                    Hệ thống tự động gom tất cả <strong>cảnh Video chưa có clip thật, ảnh gốc nhỏ/mờ, lệch khung hoặc trùng ảnh</strong> ({unclearScenesList.length} cảnh). Bấm 1 nút để <strong className="text-emerald-300">Làm Nét Ảnh HD {ratioSpec.width}×{ratioSpec.height}px</strong> giữ nguyên 100% khuôn mặt thật và <strong className="text-amber-300">Copy/Tải Trọn Bộ Prompt Vẽ Video</strong> cho Kling AI / Grok / Runway!
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  {onEnhanceCrispPhotoForScene && (
+                    <button
+                      type="button"
+                      onClick={handleBatchEnhanceUnclearCrispPhotos}
+                      disabled={isBatchEnhancingCrisp || Boolean(enhancingCrispSceneId)}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 rounded-lg shadow transition-colors whitespace-nowrap shrink-0"
+                    >
+                      {isBatchEnhancingCrisp ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          {batchCrispProgress || 'Đang làm nét HD hàng loạt...'}
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-3.5 h-3.5" />
+                          Làm Nét Ảnh HD Hàng Loạt ({unclearNeedsHdCount > 0 ? unclearNeedsHdCount : unclearScenesList.length || visualScenesList.length} Cảnh)
+                        </>
+                      )}
+                    </button>
+                  )}
+
                   <button
-                    onClick={copyMissingRealPhotoKlingPrompts}
+                    type="button"
+                    onClick={copyUnclearScenesVideoPrompts}
                     className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg shadow transition-colors whitespace-nowrap shrink-0"
                   >
-                    {copiedKey === 'copy-missing-kling' ? (
+                    {copiedKey === 'copy-unclear-batch-prompts' ? (
                       <>
                         <Check className="w-3.5 h-3.5 text-slate-950" />
-                        Đã Copy Tất Cả Prompt Kling Cảnh Thiếu Ảnh!
+                        Đã Copy Trọn Bộ Prompt ({unclearScenesList.length || visualScenesList.length} Cảnh)!
                       </>
                     ) : (
                       <>
                         <Copy className="w-3.5 h-3.5" />
-                        Copy Tất Cả Prompt Kling Của Cảnh Chưa Có Ảnh Thật ({missingRealPhotoScenes.length || visualScenesList.length} Cảnh)
+                        Copy Prompt Vẽ Video ({unclearScenesList.length || visualScenesList.length} Cảnh Không Rõ)
                       </>
                     )}
                   </button>
 
                   <button
+                    type="button"
+                    onClick={downloadUnclearScenesPromptsTxt}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-sky-500/20 hover:bg-sky-500/30 text-sky-200 border border-sky-400/50 rounded-lg transition-colors whitespace-nowrap shrink-0"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Tải File Prompt (.txt)
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => copyToClipboard(KLING_NEGATIVE_PROMPT, 'global-kling-neg')}
                     className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg transition-colors whitespace-nowrap shrink-0"
                   >
                     {copiedKey === 'global-kling-neg' ? (
                       <>
                         <Check className="w-3.5 h-3.5 text-emerald-400" />
-                        Đã Copy Negative Prompt Kling!
+                        Đã Copy Negative Prompt!
                       </>
                     ) : (
                       <>
                         <Copy className="w-3.5 h-3.5 text-sky-400" />
-                        Copy Negative Prompt Kling
+                        Negative Prompt
                       </>
                     )}
                   </button>
                 </div>
               </div>
 
-              {/* Filter Bar: All Scenes vs Missing Real Photo Scenes vs Verified Real Photo Scenes */}
+              {/* Filter Bar: Unclear Scenes HD & Prompts vs All Scenes vs Clear Verified Scenes */}
               <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800">
                 <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setSceneFilter('unclear-hd')}
+                    className={`px-3 py-1 text-xs font-bold rounded-lg border transition-colors ${
+                      sceneFilter === 'unclear-hd'
+                        ? 'bg-amber-500 text-slate-950 border-amber-300 shadow'
+                        : 'bg-amber-950/50 text-amber-200 border-amber-500/50 hover:bg-amber-900/60'
+                    }`}
+                  >
+                    ✨ Cảnh Không Rõ — Lấy Ảnh Nét HD &amp; Prompt Vẽ Video ({unclearScenesList.length} cảnh)
+                  </button>
                   <button
                     type="button"
                     onClick={() => setSceneFilter('all')}
                     className={`px-3 py-1 text-xs font-semibold rounded-lg border transition-colors ${
                       sceneFilter === 'all'
-                        ? 'bg-amber-500 text-slate-950 border-amber-400'
+                        ? 'bg-sky-500 text-slate-950 border-sky-400'
                         : 'bg-[#0B0F17] text-slate-300 border-slate-700 hover:border-slate-500'
                     }`}
                   >
-                    Tất cả theo thứ tự mượt mà ({scenes.length} cảnh)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSceneFilter('missing-photo')}
-                    className={`px-3 py-1 text-xs font-semibold rounded-lg border transition-colors ${
-                      sceneFilter === 'missing-photo'
-                        ? 'bg-amber-500 text-slate-950 border-amber-400'
-                        : 'bg-amber-950/40 text-amber-300 border-amber-500/40 hover:bg-amber-900/50'
-                    }`}
-                  >
-                    🎨 Cảnh Chưa Có Trên Mạng — Lấy Ảnh Mẫu & Prompt Vẽ / Reg Video ({missingRealPhotoScenes.length} đoạn)
+                    Tất cả theo thứ tự ({scenes.length} cảnh)
                   </button>
                   <button
                     type="button"
@@ -915,7 +1031,7 @@ QUY TẮC TỶ LỆ VIDEO (>1/2 ĐỘ DÀI TOÀN VIDEO) & KỊCH BẢN CHUYỂN 
                         : 'bg-emerald-950/40 text-emerald-300 border-emerald-500/40 hover:bg-emerald-900/50'
                     }`}
                   >
-                    🎬 Đã Có Ảnh Thật / Video Thật Chuẩn ({verifiedRealPhotoScenes.length} đoạn)
+                    🎬 Đã Có Ảnh Thật / Video Thật ({verifiedRealPhotoScenes.length} đoạn)
                   </button>
                 </div>
 
@@ -938,8 +1054,13 @@ QUY TẮC TỶ LỆ VIDEO (>1/2 ĐỘ DÀI TOÀN VIDEO) & KỊCH BẢN CHUYỂN 
             {scenes.map((scene, idx) => {
               const isVisualScene = scene.sceneType === 'video' || scene.sceneType === 'image';
               const isMissingRealPhoto = isVisualScene && scene.hasRealPhoto === false;
+              const sceneAudit = unclearAuditsById[scene.id];
+              const isUnclearScene = Boolean(sceneAudit?.isUnclear);
 
-              if (sceneFilter === 'missing-photo' && !isMissingRealPhoto) return null;
+              if (sceneFilter === 'unclear-hd' && !isUnclearScene) return null;
+              if (sceneFilter === 'missing-photo' && !isMissingRealPhoto && !isUnclearScene) {
+                return null;
+              }
               if (sceneFilter === 'has-photo' && (!isVisualScene || isMissingRealPhoto)) {
                 return null;
               }
@@ -947,6 +1068,16 @@ QUY TẮC TỶ LỆ VIDEO (>1/2 ĐỘ DÀI TOÀN VIDEO) & KỊCH BẢN CHUYỂN 
               const assignedVaultItem = vaultItems.find((v) => v.id === scene.mediaId);
               const previewUrl = assignedVaultItem?.url || scene.mediaUrl;
               const previewKind = assignedVaultItem?.type || scene.mediaKind;
+              const crispPromptPack = isVisualScene
+                ? buildUnclearSceneVideoPromptPack({
+                    scene,
+                    index: idx,
+                    totalScenes: scenes.length,
+                    characterName: activeCharacterTitle,
+                    aspectRatio,
+                    audit: sceneAudit,
+                  })
+                : null;
               const googleImgSearchUrl = `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(
                 scene.archivalKeywords || `${scene.title} vintage photo`
               )}`;
@@ -1040,24 +1171,62 @@ QUY TẮC TỶ LỆ VIDEO (>1/2 ĐỘ DÀI TOÀN VIDEO) & KỊCH BẢN CHUYỂN 
                       )}
 
                       {isVisualScene && (
-                        isMissingRealPhoto ? (
+                        scene.isCrispHd ? (
+                          <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-500/25 text-emerald-200 border border-emerald-400/60">
+                            ✨ Đã Làm Nét HD ({scene.crispHdDimensions || `${ratioSpec.width}×${ratioSpec.height}`}) — Sẵn Sàng Vẽ Video
+                          </span>
+                        ) : isMissingRealPhoto ? (
                           <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/50">
-                            🎨 Chưa có ảnh/video thật — Đã cấp sẵn Ảnh Mẫu & Prompt bên dưới để bạn Vẽ và Reg Video
+                            🎨 Chưa có ảnh/video thật — Đã cấp sẵn Ảnh Mẫu &amp; Prompt Vẽ Video
                           </span>
                         ) : previewKind === 'video' ? (
                           <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-sky-500/20 text-sky-300 border border-sky-500/40">
-                            🎬 Đã có Video Thật chuẩn: {scene.realPhotoTitle || assignedVaultItem?.name || 'Đã xác thực'}
+                            🎬 Đã có Video Thật: {scene.realPhotoTitle || assignedVaultItem?.name || 'Đã xác thực'}
                           </span>
                         ) : (
                           <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                            📸 Đã có Ảnh Thật chuẩn: {scene.realPhotoTitle || assignedVaultItem?.name || 'Đã xác thực'}
+                            📸 Ảnh gốc: {scene.realPhotoTitle || assignedVaultItem?.name || 'Đã xác thực'}
                           </span>
                         )
+                      )}
+
+                      {isVisualScene && sceneAudit && sceneAudit.reasons.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1">
+                          {sceneAudit.reasons.map((r) => (
+                            <span
+                              key={r.code}
+                              title={r.detailVi}
+                              className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-200 border border-amber-400/50"
+                            >
+                              ⚠️ {r.labelVi}
+                            </span>
+                          ))}
+                        </div>
                       )}
                     </div>
 
                     {isVisualScene && (
                       <div className="flex flex-wrap items-center gap-2">
+                        {onEnhanceCrispPhotoForScene && (
+                          <button
+                            type="button"
+                            onClick={() => onEnhanceCrispPhotoForScene(scene)}
+                            disabled={enhancingCrispSceneId === scene.id || isBatchEnhancingCrisp}
+                            className="flex items-center gap-1 px-2.5 py-1 text-xs font-bold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 rounded-md shadow transition-colors whitespace-nowrap shrink-0"
+                          >
+                            {enhancingCrispSceneId === scene.id ? (
+                              <>
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                Đang làm nét HD...
+                              </>
+                            ) : (
+                              <>
+                                <Sparkles className="w-3.5 h-3.5" />
+                                ✨ Làm Nét Ảnh HD ({ratioSpec.width}×{ratioSpec.height})
+                              </>
+                            )}
+                          </button>
+                        )}
                         {onOpenSceneMediaSearch && (
                           <button
                             type="button"
@@ -1079,11 +1248,13 @@ QUY TẮC TỶ LỆ VIDEO (>1/2 ĐỘ DÀI TOÀN VIDEO) & KỊCH BẢN CHUYỂN 
                             <span>🔄 Đổi Video Thay Thế #{String(idx + 1).padStart(2, '0')}</span>
                           </button>
                         )}
-                        {klingStandardPack && (
+                        {(crispPromptPack || klingStandardPack) && (
                           <button
                             onClick={() =>
                               copyToClipboard(
-                                scene.klingStandardPrompt || klingStandardPack.combinedBlock,
+                                crispPromptPack?.combinedCopyBlock ||
+                                  scene.klingStandardPrompt ||
+                                  klingStandardPack!.combinedBlock,
                                 `kling-pack-${scene.id}`
                               )
                             }
@@ -1092,12 +1263,12 @@ QUY TẮC TỶ LỆ VIDEO (>1/2 ĐỘ DÀI TOÀN VIDEO) & KỊCH BẢN CHUYỂN 
                             {copiedKey === `kling-pack-${scene.id}` ? (
                               <>
                                 <Check className="w-3 h-3 text-emerald-400" />
-                                Đã Copy Prompt Vẽ & Reg Video #{String(idx + 1).padStart(2, '0')}!
+                                Đã Copy Prompt Vẽ &amp; Reg Video #{String(idx + 1).padStart(2, '0')}!
                               </>
                             ) : (
                               <>
                                 <Copy className="w-3 h-3" />
-                                Copy Trọn Bộ Prompt Vẽ & Reg Video #{String(idx + 1).padStart(2, '0')}
+                                Copy Trọn Bộ Prompt Vẽ Video #{String(idx + 1).padStart(2, '0')}
                               </>
                             )}
                           </button>
@@ -1116,9 +1287,21 @@ QUY TẮC TỶ LỆ VIDEO (>1/2 ĐỘ DÀI TOÀN VIDEO) & KỊCH BẢN CHUYỂN 
                           ) : (
                             <>
                               <Sparkles className="w-3 h-3" />
-                              Vẽ Ảnh Gốc Full Khung ({ratioSpec.ratio})
+                              Vẽ Ảnh Mới Bằng AI ({ratioSpec.ratio})
                             </>
                           )}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onUpdateScene(scene.id, {
+                              unclearFlagOverride: isUnclearScene ? false : true,
+                            })
+                          }
+                          className="px-2 py-1 text-[11px] font-semibold bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-md transition-colors whitespace-nowrap shrink-0"
+                        >
+                          {isUnclearScene ? '✓ Đánh dấu đã rõ' : '+ Thêm vào cảnh mờ'}
                         </button>
 
                         {/* 1-Click Download Reference Face Portrait for Kling AI when scene is missing its own real photo */}

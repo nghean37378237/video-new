@@ -7408,6 +7408,159 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     }
   });
 
+  // 3a-0. Enhance an unclear/low-res photo (or extract & sharpen a frame from a video) into a crisp Full-Frame HD image (1080x1440 / 1080x1920 / 1920x1080)
+  app.post("/api/media/enhance-crisp-photo", async (req, res) => {
+    const tempFiles: string[] = [];
+    try {
+      const {
+        imageUrl,
+        aspectRatio = "3:4",
+        mediaKind = "image",
+        trimStartSec = 0,
+      } = req.body || {};
+
+      if (!imageUrl || typeof imageUrl !== "string") {
+        res.status(400).json({ error: "Thiếu dữ liệu ảnh/video nguồn để làm nét HD." });
+        return;
+      }
+
+      const validRatio: "3:4" | "9:16" | "16:9" =
+        aspectRatio === "9:16" || aspectRatio === "16:9" ? aspectRatio : "3:4";
+      const targetW = validRatio === "16:9" ? 1920 : 1080;
+      const targetH = validRatio === "9:16" ? 1920 : validRatio === "16:9" ? 1080 : 1440;
+
+      const stamp = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const isVideoInput =
+        mediaKind === "video" || /\.(mp4|mov|webm|mkv)(\?|$|#)/i.test(imageUrl);
+      const inputExt = isVideoInput ? "mp4" : "img";
+      const inputTemp = path.join(YT_CUTS_DIR, `tmp_crisp_in_${stamp}.${inputExt}`);
+      const outputTemp = path.join(YT_CUTS_DIR, `tmp_crisp_out_${stamp}.jpg`);
+      tempFiles.push(inputTemp, outputTemp);
+
+      const cleanUrl = imageUrl.split("#")[0].trim();
+
+      if (cleanUrl.startsWith("data:image/")) {
+        const commaIdx = cleanUrl.indexOf(",");
+        const base64Part = commaIdx >= 0 ? cleanUrl.slice(commaIdx + 1) : "";
+        if (!base64Part) {
+          res.status(400).json({ error: "Dữ liệu ảnh base64 không hợp lệ." });
+          return;
+        }
+        fs.writeFileSync(inputTemp, Buffer.from(base64Part, "base64"));
+      } else if (cleanUrl.startsWith("/api/youtube/cut-file/")) {
+        const rawFileName = cleanUrl
+          .replace("/api/youtube/cut-file/", "")
+          .split("?")[0];
+        const safeName = path.basename(decodeURIComponent(rawFileName));
+        const candidatePath = path.resolve(YT_CUTS_DIR, safeName);
+        if (
+          !candidatePath.startsWith(path.resolve(YT_CUTS_DIR)) ||
+          !fs.existsSync(candidatePath)
+        ) {
+          res.status(404).json({ error: "Không tìm thấy file video nguồn trên máy chủ." });
+          return;
+        }
+        fs.copyFileSync(candidatePath, inputTemp);
+      } else if (cleanUrl.startsWith("/")) {
+        const publicRoot = path.resolve(process.cwd(), "public");
+        const cleanRel = cleanUrl.replace(/^\/+/, "").split("?")[0];
+        const candidatePath = path.resolve(publicRoot, cleanRel);
+        if (
+          !candidatePath.startsWith(publicRoot) ||
+          !fs.existsSync(candidatePath)
+        ) {
+          res.status(404).json({ error: "Không tìm thấy file ảnh nguồn trong thư mục public." });
+          return;
+        }
+        fs.copyFileSync(candidatePath, inputTemp);
+      } else if (/^https?:\/\//i.test(cleanUrl)) {
+        const parsed = new URL(cleanUrl);
+        const host = parsed.hostname.toLowerCase();
+        if (
+          host === "localhost" ||
+          host === "127.0.0.1" ||
+          host === "::1" ||
+          host.startsWith("10.") ||
+          host.startsWith("192.168.") ||
+          host.startsWith("169.254.") ||
+          /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+        ) {
+          res.status(400).json({ error: "Địa chỉ URL nguồn không hợp lệ." });
+          return;
+        }
+        const dlRes = await fetch(cleanUrl, {
+          headers: { "User-Agent": BROWSER_USER_AGENT },
+          signal: AbortSignal.timeout(9000),
+        });
+        if (!dlRes.ok) {
+          res.status(400).json({ error: `Không tải được ảnh nguồn (${dlRes.status}).` });
+          return;
+        }
+        const arrBuf = await dlRes.arrayBuffer();
+        fs.writeFileSync(inputTemp, Buffer.from(arrBuf));
+      } else {
+        res.status(400).json({ error: "Định dạng đường dẫn ảnh/video không được hỗ trợ." });
+        return;
+      }
+
+      // FFmpeg HD Crisp Restoration: Lanczos super-res upscale + headroom-safe framing + denoise + optical unsharp + clarity EQ
+      const vfFilter = [
+        `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase:flags=lanczos`,
+        `crop=${targetW}:${targetH}:(iw-ow)/2:(ih-oh)*0.22`,
+        `hqdn3d=1.4:1.4:3:3`,
+        `unsharp=5:5:1.25:5:5:0.45`,
+        `eq=contrast=1.06:saturation=1.06:brightness=0.01`,
+      ].join(",");
+
+      const ffmpegArgs: string[] = ["-y"];
+      if (isVideoInput) {
+        const seekSec = Math.max(0.2, Number(trimStartSec) || 0.5);
+        ffmpegArgs.push("-ss", String(seekSec));
+      }
+      ffmpegArgs.push(
+        "-i",
+        inputTemp,
+        "-frames:v",
+        "1",
+        "-vf",
+        vfFilter,
+        "-q:v",
+        "2",
+        outputTemp
+      );
+
+      await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 20000 });
+
+      if (!fs.existsSync(outputTemp)) {
+        throw new Error("Không xuất được ảnh nét HD.");
+      }
+
+      const outBuf = fs.readFileSync(outputTemp);
+      const imageDataUrl = `data:image/jpeg;base64,${outBuf.toString("base64")}`;
+
+      res.json({
+        imageDataUrl,
+        width: targetW,
+        height: targetH,
+        dimensionsLabel: `${targetW}×${targetH}`,
+        engine: "ffmpeg-hd-crisp",
+      });
+    } catch (error: any) {
+      console.error("Enhance crisp HD photo error:", error);
+      res.status(500).json({
+        error: error?.message || "Không thể làm nét ảnh HD cho cảnh này.",
+      });
+    } finally {
+      for (const fp of tempFiles) {
+        try {
+          if (fs.existsSync(fp)) fs.unlinkSync(fp);
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+    }
+  });
+
   // 3a. Split a multi-panel collage photo (e.g. 3-panel left + top-right + bottom-right) into 3 clean 3:4 portrait frames via FFmpeg
   app.post("/api/media/split-collage", async (req, res) => {
     const tempFiles: string[] = [];
