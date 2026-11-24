@@ -80,6 +80,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
   const playAnchorMediaTimeRef = useRef<number>(0);
   const exportStartWallTimeRef = useRef<number | null>(null);
   const exportTargetDurationRef = useRef<number>(0);
+  const renderPausedFrameRef = useRef<(() => void) | null>(null);
 
   const [isMuted, setIsMuted] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -99,6 +100,9 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
       lastInternalTimeUpdateRef.current = currentTimeSec;
       playAnchorMediaTimeRef.current = currentTimeSec;
       playAnchorWallTimeRef.current = isPlaying ? performance.now() : null;
+      if (!isPlaying) {
+        renderPausedFrameRef.current?.();
+      }
     }
   }, [currentTimeSec, isPlaying, isExporting]);
 
@@ -167,12 +171,17 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
     vaultItems.forEach((item) => {
       if (item.type === 'image' && item.url) imageUrls.add(item.url);
       if (item.thumbnailUrl) imageUrls.add(item.thumbnailUrl);
-      if (item.type === 'video' && item.url && !SAMPLE_VIDEO_URLS.has(item.url)) {
-        videoUrls.add(item.url);
-      }
+      // Do NOT preload unassigned vault videos — Chrome caps HTTP/1.1 at 6 connections per origin
+      // and preloading dozens of idle saved_cuts starves interactive POST /api/youtube/cut-clips calls.
     });
 
-    scenes.forEach((sc) => {
+    const activeIdx = Math.max(
+      0,
+      scenes.findIndex((s) => s.id === activeSceneId)
+    );
+    const activeWindowUrls = new Set<string>();
+
+    scenes.forEach((sc, scIdx) => {
       if (sc.characterRefPhotoUrl) {
         imageUrls.add(sc.characterRefPhotoUrl);
       }
@@ -187,6 +196,23 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
         imageUrls.add(url);
       } else if (kind === 'video' && !SAMPLE_VIDEO_URLS.has(url)) {
         videoUrls.add(url);
+        if (Math.abs(scIdx - activeIdx) <= 1) {
+          activeWindowUrls.add(url);
+        }
+      }
+    });
+
+    // Release pooled videos that are no longer assigned to any scene
+    videoPoolRef.current.forEach((vid, pooledUrl) => {
+      if (!videoUrls.has(pooledUrl)) {
+        try {
+          vid.pause();
+          vid.removeAttribute('src');
+          vid.load();
+        } catch {
+          // ignore
+        }
+        videoPoolRef.current.delete(pooledUrl);
       }
     });
 
@@ -200,51 +226,57 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
     });
 
     videoUrls.forEach((url) => {
-      if (!videoPoolRef.current.has(url)) {
-        const vid = document.createElement('video');
-        vid.crossOrigin = 'anonymous';
-        vid.playsInline = true;
-        vid.muted = true;
-        vid.loop = true;
-        vid.preload = 'auto';
-        const matchingScene = scenes.find((s) => {
-          const vItem = vaultItems.find((v) => v.id === s.mediaId);
-          return (vItem?.url || s.mediaUrl) === url;
-        });
-        const initialTrimStart =
-          typeof matchingScene?.videoTrimStartSec === 'number' && matchingScene.videoTrimStartSec > 0
-            ? matchingScene.videoTrimStartSec
-            : url.includes('/api/archival/video-stream')
-            ? 18
-            : 0;
-        if (initialTrimStart > 0) {
-          vid.addEventListener(
-            'loadedmetadata',
-            () => {
-              const dur = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 9999;
-              if (dur > initialTrimStart + 2 && vid.currentTime < initialTrimStart) {
-                try {
-                  vid.currentTime = initialTrimStart;
-                } catch {
-                  // ignore seek error
-                }
-              }
-            },
-            { once: true }
-          );
+      const existingVid = videoPoolRef.current.get(url);
+      if (existingVid) {
+        const desiredPreload = activeWindowUrls.has(url) ? 'auto' : 'metadata';
+        if (existingVid.preload !== desiredPreload) {
+          existingVid.preload = desiredPreload;
         }
-        const cleanVidSrc = url.includes('/api/youtube/cut-file/') ? url.split('#')[0] : url;
-        vid.addEventListener('error', () => {
-          if (videoPoolRef.current.get(url) === vid) {
-            videoPoolRef.current.delete(url);
-          }
-        });
-        vid.src = cleanVidSrc;
-        vid.load();
-        videoPoolRef.current.set(url, vid);
+        return;
       }
+      const vid = document.createElement('video');
+      vid.crossOrigin = 'anonymous';
+      vid.playsInline = true;
+      vid.muted = true;
+      vid.loop = true;
+      vid.preload = activeWindowUrls.has(url) ? 'auto' : 'metadata';
+      const matchingScene = scenes.find((s) => {
+        const vItem = vaultItems.find((v) => v.id === s.mediaId);
+        return (vItem?.url || s.mediaUrl) === url;
+      });
+      const initialTrimStart =
+        typeof matchingScene?.videoTrimStartSec === 'number' && matchingScene.videoTrimStartSec > 0
+          ? matchingScene.videoTrimStartSec
+          : url.includes('/api/archival/video-stream')
+          ? 18
+          : 0;
+      if (initialTrimStart > 0) {
+        vid.addEventListener(
+          'loadedmetadata',
+          () => {
+            const dur = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 9999;
+            if (dur > initialTrimStart + 2 && vid.currentTime < initialTrimStart) {
+              try {
+                vid.currentTime = initialTrimStart;
+              } catch {
+                // ignore seek error
+              }
+            }
+          },
+          { once: true }
+        );
+      }
+      const cleanVidSrc = url.includes('/api/youtube/cut-file/') ? url.split('#')[0] : url;
+      vid.addEventListener('error', () => {
+        if (videoPoolRef.current.get(url) === vid) {
+          videoPoolRef.current.delete(url);
+        }
+      });
+      vid.src = cleanVidSrc;
+      vid.load();
+      videoPoolRef.current.set(url, vid);
     });
-  }, [vaultItems, scenes]);
+  }, [vaultItems, scenes, activeSceneId]);
 
   // Cleanup pooled video elements on unmount
   useEffect(() => {
@@ -1409,12 +1441,30 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
 
     };
 
+    let idleSettleTimer: ReturnType<typeof setInterval> | null = null;
+    renderPausedFrameRef.current = () => stepAndRender(performance.now());
+
     const loop = (now: number) => {
       stepAndRender(now);
-      animFrameId = requestAnimationFrame(loop);
+      if (isPlaying || isExporting) {
+        animFrameId = requestAnimationFrame(loop);
+      }
     };
 
     animFrameId = requestAnimationFrame(loop);
+
+    // When paused, avoid burning 100% CPU with a 60fps loop; do a brief settle pass so newly loaded video/image frames paint cleanly
+    if (!isPlaying && !isExporting) {
+      let settleTicks = 0;
+      idleSettleTimer = setInterval(() => {
+        settleTicks += 1;
+        stepAndRender(performance.now());
+        if (settleTicks >= 6 && idleSettleTimer) {
+          clearInterval(idleSettleTimer);
+          idleSettleTimer = null;
+        }
+      }, 300);
+    }
 
     // Backup 30fps wall-clock ticker during video export so backgrounding the browser tab never stretches export duration
     if (isExporting && isPlaying) {
@@ -1424,9 +1474,13 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
     }
 
     return () => {
+      renderPausedFrameRef.current = null;
       cancelAnimationFrame(animFrameId);
       if (exportBackupTimer) {
         clearInterval(exportBackupTimer);
+      }
+      if (idleSettleTimer) {
+        clearInterval(idleSettleTimer);
       }
     };
   }, [

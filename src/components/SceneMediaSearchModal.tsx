@@ -18,7 +18,12 @@ import {
   Trash2,
 } from 'lucide-react';
 import { ProjectSettings, StoryScene, VaultItem } from '../types';
-import { captureRealVideoFrameThumbnail } from '../utils/realActorVideoTrimmer';
+import {
+  extractRawArchivalVideoUrl,
+  normalizeCutWindow,
+  shouldMountInlineVideoScrubber,
+} from '../utils/videoCutPlanner';
+import { cutVideoInBrowser } from '../utils/clientVideoCutter';
 
 export interface SceneVideoOption {
   id: string;
@@ -185,8 +190,39 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
   const [videoPlayheadSec, setVideoPlayheadSec] = useState<Record<string, number>>({});
   const [videoActualDurationSec, setVideoActualDurationSec] = useState<Record<string, number>>({});
   const [previewingArchivalId, setPreviewingArchivalId] = useState<string | null>(null);
+  // Strictly allow AT MOST ONE inline <video> scrubber mounted across Section 0 + Section A
+  // so Chrome's 6-connection HTTP/1.1 pool is never saturated before POST /api/youtube/cut-clips fires.
+  const [activeScrubberCardId, setActiveScrubberCardId] = useState<string | null>(null);
   const archivalVideoRefs = React.useRef<Record<string, HTMLVideoElement | null>>({});
   const resultsBodyRef = React.useRef<HTMLDivElement | null>(null);
+
+  const stopAllInlinePreviewStreams = () => {
+    setActiveScrubberCardId(null);
+    setPreviewingArchivalId(null);
+    setPreviewingYtId(null);
+    Object.values(archivalVideoRefs.current).forEach((el) => {
+      if (el) {
+        try {
+          el.pause();
+          el.removeAttribute('src');
+          el.load();
+        } catch {
+          // ignore
+        }
+      }
+    });
+    Object.values(ytVideoRefs.current).forEach((el) => {
+      if (el) {
+        try {
+          el.pause();
+          el.removeAttribute('src');
+          el.load();
+        } catch {
+          // ignore
+        }
+      }
+    });
+  };
 
   // Persistent Saved Cuts Library (allows downloading MP4 to computer or replacing into any scene)
   const [savedCuts, setSavedCuts] = useState<CutYouTubeResultItem[]>(() => {
@@ -666,21 +702,14 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
             setArchivalTargetScenes((prev) => ({ ...nextArchTargets, ...prev }));
           }
         } else {
-          setCustomTrimStarts(initialTrims);
-          setCustomTrimEnds(initialTrimEnds);
+          setCustomTrimStarts((prev) => ({ ...initialTrims, ...prev }));
+          setCustomTrimEnds((prev) => ({ ...initialTrimEnds, ...prev }));
           if (targetSceneForDefault) {
-            setArchivalTargetScenes(nextArchTargets);
+            setArchivalTargetScenes((prev) => ({ ...nextArchTargets, ...prev }));
           }
         }
-
-        vids.slice(0, 4).forEach((v) => {
-          captureRealVideoFrameThumbnail(v.videoUrl, v.trimStartSec, 7500).then((frameUrl) => {
-            if (!frameUrl) return;
-            setVideoOptions((prev) =>
-              prev.map((item) => (item.id === v.id ? { ...item, dataUrl: frameUrl } : item))
-            );
-          });
-        });
+        // Do NOT auto-spawn hidden <video preload="auto"> thumbnail extractors on modal open —
+        // opening 4 concurrent /api/archival/video-stream sockets saturates HTTP/1.1 connections.
       })
       .catch(() => {})
       .finally(() => {
@@ -758,8 +787,11 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
       setLatestAcceptedCut(null);
       setJustCutBanner(null);
       setShowSavedCutsDrawer(false);
+      setActiveScrubberCardId(null);
       loadSavedCutsFromServer();
       executeSearch(defaultQuery, 0, initSceneId, false, 'all');
+    } else {
+      stopAllInlinePreviewStreams();
     }
   }, [isOpen, scene?.id, initialTab, cleanCharName]);
 
@@ -856,7 +888,47 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     setQueuedSegments((prev) => prev.filter((q) => q.queueId !== queueId));
   };
 
-  // Cut and replace from a Replacement Video card (Section 0) via FFmpeg & save into Kho Đã Cắt
+  // Helper: finalize a client-trimmed cut (Vercel / no-FFmpeg fallback) directly in the browser
+  const finalizeClientTrimCutsIfNeeded = async (
+    cuts: Array<CutYouTubeResultItem & { clientTrimRequired?: boolean }>
+  ): Promise<CutYouTubeResultItem[]> => {
+    const out: CutYouTubeResultItem[] = [];
+    for (const cut of cuts) {
+      if (!cut.clientTrimRequired) {
+        out.push(cut);
+        continue;
+      }
+      try {
+        const cleanSrc = (cut.videoUrl || '').split('#')[0];
+        const browserCut = await cutVideoInBrowser({
+          source: cleanSrc,
+          startSec: cut.originalStartSec ?? cut.trimStartSec ?? 0,
+          endSec: cut.originalEndSec ?? cut.trimEndSec ?? (cut.durationSec || 8),
+          frameMode: cutFrameMode,
+          focusX: cutFocusX,
+        });
+        out.push({
+          ...cut,
+          videoUrl: browserCut.videoUrl,
+          thumbnailUrl: browserCut.thumbnailUrl || cut.thumbnailUrl,
+          trimStartSec: browserCut.startSec,
+          trimEndSec: browserCut.endSec,
+          durationSec: browserCut.durationSec,
+          width: browserCut.width,
+          height: browserCut.height,
+          sourceLabel:
+            browserCut.mode === 'browser-reencoded'
+              ? `✂️ Đã cắt 3:4 HD trên Trình Duyệt (${cut.originalStartSec}s → ${cut.originalEndSec}s)`
+              : `✂️ Đã khóa đoạn cắt (${cut.originalStartSec}s → ${cut.originalEndSec}s)`,
+        });
+      } catch {
+        out.push(cut);
+      }
+    }
+    return out;
+  };
+
+  // Cut and replace from a Replacement Video card (Section 0) via FFmpeg (or browser fallback) & save into Kho Đã Cắt
   const handleAcceptCutFromReplacementVideo = async (
     vid: SceneVideoOption,
     chosenSceneId: string,
@@ -865,18 +937,22 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     closeAfter = false
   ) => {
     if (isCuttingYouTube || !chosenSceneId) return;
-    const cleanStreamUrl = (vid.videoUrl || '').split('#')[0];
-    let archiveMp4Url = cleanStreamUrl;
-    if (cleanStreamUrl.includes('/api/archival/video-stream?url=')) {
-      const uParam = cleanStreamUrl.split('url=')[1];
-      if (uParam) archiveMp4Url = decodeURIComponent(uParam.split('&')[0]);
-    }
-    const dur = Math.max(3, endSec - startSec);
+    stopAllInlinePreviewStreams();
+
+    const win = normalizeCutWindow(startSec, endSec, {
+      defaultDurationSec: getSceneDurationById(chosenSceneId),
+      minDurationSec: 3,
+      maxDurationSec: 35,
+    });
+    const cleanStart = Math.round(win.startSec);
+    const cleanEnd = Math.round(win.endSec);
+    const dur = Math.max(3, cleanEnd - cleanStart);
+    const archiveMp4Url = extractRawArchivalVideoUrl(vid.videoUrl || '');
 
     setIsCuttingYouTube(true);
     setCuttingCardId(vid.id);
     const cutCtrl = new AbortController();
-    const cutTimeout = setTimeout(() => cutCtrl.abort(), 110000);
+    const cutTimeout = setTimeout(() => cutCtrl.abort(), 90000);
     try {
       const res = await fetch('/api/youtube/cut-clips', {
         method: 'POST',
@@ -895,8 +971,8 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
               archiveMp4Url,
               preferArchiveMp4: true,
               thumbnailUrl: vid.dataUrl,
-              trimStartSec: startSec,
-              trimEndSec: endSec,
+              trimStartSec: cleanStart,
+              trimEndSec: cleanEnd,
               durationSec: dur,
               frameMode: cutFrameMode,
               focusX: cutFocusX,
@@ -908,15 +984,16 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data?.cuts) && data.cuts.length > 0 && onInsertCutYouTubeClips) {
+          const finalized = await finalizeClientTrimCutsIfNeeded(data.cuts);
           const cutObj: CutYouTubeResultItem = {
-            ...data.cuts[0],
+            ...finalized[0],
             characterName: activeCharName,
             targetSceneId: chosenSceneId,
           };
           onInsertCutYouTubeClips([cutObj], chosenSceneId);
 
           const nextSaved: CutYouTubeResultItem[] =
-            Array.isArray(data?.savedCuts) && data.savedCuts.length > 0
+            Array.isArray(data?.savedCuts) && data.savedCuts.length > 0 && !data.cuts[0]?.clientTrimRequired
               ? data.savedCuts
               : [
                   cutObj,
@@ -932,7 +1009,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
           setSavedCutTargetScenes((prev) => ({ ...prev, [cutObj.id]: chosenSceneId }));
           setSelectedModalSceneId(chosenSceneId);
           setJustCutBanner(
-            `✅ ĐÃ CHẤP NHẬN CẮT (${startSec}s → ${endSec}s) & THAY VÀO ${getSceneBadgeById(chosenSceneId).toUpperCase()}! Bạn có thể xem lại đoạn vừa cắt ngay bên dưới, bấm đổi sang Phần khác chỉ với 1-Click, hoặc bấm "Đóng & Xem Ngay Trên Timeline".`
+            `✅ ĐÃ CHẤP NHẬN CẮT (${cleanStart}s → ${cleanEnd}s) & THAY VÀO ${getSceneBadgeById(chosenSceneId).toUpperCase()}! Bạn có thể xem lại đoạn vừa cắt ngay bên dưới, bấm đổi sang Phần khác chỉ với 1-Click, hoặc bấm "Đóng & Xem Ngay Trên Timeline".`
           );
           if (closeAfter) {
             onClose();
@@ -941,14 +1018,58 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
           resultsBodyRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
           return;
         }
-      } else {
-        const errData = await res.json().catch(() => null);
-        setJustCutBanner(
-          errData?.error ||
-            '⚠️ Không thể tải luồng MP4 từ video này để cắt. Hãy chọn video có nhãn "✂️ Cắt Trực Tiếp MP4" (Dailymotion / TikTok / Archive) hoặc up file MP4 từ máy để cắt chuẩn 100%!'
-        );
-        resultsBodyRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
       }
+
+      // Fallback: if server returned 422/500 but the stream is directly playable, cut cleanly in browser!
+      const fallbackStream = (vid.videoUrl || '').split('#')[0];
+      if (fallbackStream && onInsertCutYouTubeClips) {
+        const browserCut = await cutVideoInBrowser({
+          source: fallbackStream,
+          startSec: cleanStart,
+          endSec: cleanEnd,
+          frameMode: cutFrameMode,
+          focusX: cutFocusX,
+        });
+        const cutObj: CutYouTubeResultItem = {
+          id: `browser-cut-${Date.now()}`,
+          targetSceneId: chosenSceneId,
+          characterName: activeCharName,
+          title: vid.title,
+          videoUrl: browserCut.videoUrl,
+          sourceVideoUrl: archiveMp4Url,
+          thumbnailUrl: browserCut.thumbnailUrl || vid.dataUrl,
+          trimStartSec: browserCut.startSec,
+          trimEndSec: browserCut.endSec,
+          originalStartSec: cleanStart,
+          originalEndSec: cleanEnd,
+          durationSec: browserCut.durationSec,
+          width: browserCut.width,
+          height: browserCut.height,
+          frameMode: cutFrameMode,
+          focusX: cutFocusX,
+          sourceLabel: `✂️ Đã cắt trên Trình Duyệt (${cleanStart}s → ${cleanEnd}s)`,
+        };
+        onInsertCutYouTubeClips([cutObj], chosenSceneId);
+        setLatestAcceptedCut(cutObj);
+        setSavedCutTargetScenes((prev) => ({ ...prev, [cutObj.id]: chosenSceneId }));
+        setSelectedModalSceneId(chosenSceneId);
+        setJustCutBanner(
+          `✅ ĐÃ CẮT TRỰC TIẾP TRÊN TRÌNH DUYỆT (${cleanStart}s → ${cleanEnd}s) & THAY VÀO ${getSceneBadgeById(chosenSceneId).toUpperCase()}!`
+        );
+        if (closeAfter) {
+          onClose();
+          return;
+        }
+        resultsBodyRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+        return;
+      }
+
+      const errData = await res.json().catch(() => null);
+      setJustCutBanner(
+        errData?.error ||
+          '⚠️ Không thể tải luồng MP4 từ video này để cắt. Hãy chọn video có nhãn "✂️ Cắt Trực Tiếp MP4" (Dailymotion / Archive) hoặc up file MP4 từ máy để cắt chuẩn 100%!'
+      );
+      resultsBodyRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
     } catch {
       setJustCutBanner(
         '⏱️ Quá thời gian chờ tải nguồn video để cắt. Hãy chọn video "✂️ Cắt Trực Tiếp MP4" hoặc up file MP4 từ máy!'
@@ -963,6 +1084,8 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
 
   const handleCutLocalUploadedVideo = async (closeAfter = false) => {
     if (!localCutFile || isCuttingYouTube || !onInsertCutYouTubeClips) return;
+    stopAllInlinePreviewStreams();
+
     const chosenSceneId =
       localCutTargetSceneId ||
       effectiveScene?.id ||
@@ -970,56 +1093,114 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
       activeSceneId ||
       selectableScenes[0]?.id ||
       '';
-    const startSec = Math.max(0, Math.round(localCutStartSec));
-    const endSec = Math.max(startSec + 3, Math.round(localCutEndSec));
+    const win = normalizeCutWindow(localCutStartSec, localCutEndSec, {
+      totalDurationSec: localCutActualDur > 0 ? localCutActualDur : undefined,
+      defaultDurationSec: getSceneDurationById(chosenSceneId),
+      minDurationSec: 2,
+      maxDurationSec: 35,
+    });
+    const startSec = Math.round(win.startSec);
+    const endSec = Math.round(win.endSec);
+
     setIsCuttingYouTube(true);
     setCuttingCardId('__LOCAL_UPLOAD__');
     try {
-      const params = new URLSearchParams({
-        startSec: String(startSec),
-        endSec: String(endSec),
-        title: localCutFile.name.replace(/\.[^.]+$/, ''),
-        targetSceneId: chosenSceneId,
-        characterName: activeCharName,
-        frameMode: cutFrameMode,
-        focusX: cutFocusX,
-      });
-      const res = await fetch(`/api/youtube/cut-uploaded-raw?${params.toString()}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: localCutFile,
-      });
-      const data = await res.json().catch(() => null);
-      if (res.ok && Array.isArray(data?.cuts) && data.cuts.length > 0) {
-        const cutObj: CutYouTubeResultItem = {
-          ...data.cuts[0],
-          characterName: activeCharName,
-          targetSceneId: chosenSceneId,
-        };
-        onInsertCutYouTubeClips([cutObj], chosenSceneId);
-        const nextSaved: CutYouTubeResultItem[] = Array.isArray(data?.savedCuts)
-          ? data.savedCuts
-          : [cutObj, ...savedCuts];
-        setSavedCuts(nextSaved);
+      const cleanTitle = localCutFile.name.replace(/\.[^.]+$/, '');
+      let cutObj: CutYouTubeResultItem | null = null;
+      let serverSavedCuts: CutYouTubeResultItem[] | null = null;
+
+      // Try fast server FFmpeg cut first when file is under 4.2MB (safe for both AI Studio & Vercel)
+      const canTryServerUpload = localCutFile.size <= 4_200_000 || window.location.hostname === 'localhost';
+      if (canTryServerUpload) {
         try {
-          localStorage.setItem('legendcut_saved_cuts_list_v1', JSON.stringify(nextSaved));
-        } catch {}
-        setLatestAcceptedCut(cutObj);
-        setSavedCutTargetScenes((prev) => ({ ...prev, [cutObj.id]: chosenSceneId }));
-        setSelectedModalSceneId(chosenSceneId);
-        setJustCutBanner(
-          `✅ ĐÃ CẮT VIDEO MÁY (${startSec}s → ${endSec}s) & THAY VÀO ${getSceneBadgeById(chosenSceneId).toUpperCase()}!`
-        );
-        if (closeAfter) {
-          onClose();
-          return;
+          const params = new URLSearchParams({
+            startSec: String(startSec),
+            endSec: String(endSec),
+            title: cleanTitle,
+            targetSceneId: chosenSceneId,
+            characterName: activeCharName,
+            frameMode: cutFrameMode,
+            focusX: cutFocusX,
+          });
+          const res = await fetch(`/api/youtube/cut-uploaded-raw?${params.toString()}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: localCutFile,
+          });
+          const data = await res.json().catch(() => null);
+          if (res.ok && Array.isArray(data?.cuts) && data.cuts.length > 0) {
+            cutObj = {
+              ...data.cuts[0],
+              characterName: activeCharName,
+              targetSceneId: chosenSceneId,
+            };
+            if (Array.isArray(data?.savedCuts)) {
+              serverSavedCuts = data.savedCuts;
+            }
+          }
+        } catch {
+          // Fall through cleanly to browser-side cutter!
         }
-        resultsBodyRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
-      } else {
-        setJustCutBanner(data?.error || '⚠️ Không thể cắt file video vừa tải lên.');
       }
-    } catch {
-      setJustCutBanner('⚠️ Lỗi kết nối khi gửi file video lên máy chủ để cắt.');
+
+      // Automatic Browser-Side 3:4 HD Video Cutter Fallback (Vercel no-FFmpeg OR files >4.2MB!)
+      if (!cutObj) {
+        const browserCut = await cutVideoInBrowser({
+          source: localCutFile,
+          startSec,
+          endSec,
+          frameMode: cutFrameMode,
+          focusX: cutFocusX,
+        });
+        cutObj = {
+          id: `local-browser-cut-${Date.now()}`,
+          targetSceneId: chosenSceneId,
+          characterName: activeCharName,
+          title: cleanTitle,
+          videoUrl: browserCut.videoUrl,
+          sourceVideoUrl: 'local-browser-upload',
+          thumbnailUrl: browserCut.thumbnailUrl,
+          trimStartSec: browserCut.startSec,
+          trimEndSec: browserCut.endSec,
+          originalStartSec: startSec,
+          originalEndSec: endSec,
+          durationSec: browserCut.durationSec,
+          width: browserCut.width,
+          height: browserCut.height,
+          frameMode: cutFrameMode,
+          focusX: cutFocusX,
+          sourceLabel:
+            browserCut.mode === 'browser-reencoded'
+              ? `✂️ Đã cắt Video Máy 3:4 HD (${startSec}s → ${endSec}s)`
+              : `✂️ Video Máy Khóa Đoạn (${startSec}s → ${endSec}s)`,
+        };
+      }
+
+      onInsertCutYouTubeClips([cutObj], chosenSceneId);
+      const nextSaved: CutYouTubeResultItem[] = serverSavedCuts
+        ? serverSavedCuts
+        : [cutObj, ...savedCuts.filter((s) => s.id !== cutObj!.id)];
+      setSavedCuts(nextSaved);
+      try {
+        // Persist only non-blob URLs in localStorage so reloads never hold dead blob: links
+        const persistable = nextSaved.filter((s) => !String(s.videoUrl || '').startsWith('blob:'));
+        localStorage.setItem('legendcut_saved_cuts_list_v1', JSON.stringify(persistable));
+      } catch {}
+      setLatestAcceptedCut(cutObj);
+      setSavedCutTargetScenes((prev) => ({ ...prev, [cutObj!.id]: chosenSceneId }));
+      setSelectedModalSceneId(chosenSceneId);
+      setJustCutBanner(
+        `✅ ĐÃ CẮT VIDEO MÁY (${startSec}s → ${endSec}s) & THAY VÀO ${getSceneBadgeById(chosenSceneId).toUpperCase()}!`
+      );
+      if (closeAfter) {
+        onClose();
+        return;
+      }
+      resultsBodyRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (err: any) {
+      setJustCutBanner(
+        `⚠️ Không thể cắt file video vừa tải lên (${err?.message || 'định dạng không hỗ trợ'}). Hãy thử file MP4/WebM chuẩn!`
+      );
     } finally {
       setIsCuttingYouTube(false);
       setCuttingCardId(null);
@@ -1032,6 +1213,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     closeAfter = false
   ) => {
     if (isCuttingYouTube || !onInsertCutYouTubeClips) return;
+    stopAllInlinePreviewStreams();
 
     let segmentsToCut: QueuedYouTubeSegment[] = [];
     if (specificVideo) {
@@ -1067,7 +1249,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
 
     setIsCuttingYouTube(true);
     const cutCtrl = new AbortController();
-    const cutTimeout = setTimeout(() => cutCtrl.abort(), 110000);
+    const cutTimeout = setTimeout(() => cutCtrl.abort(), 90000);
     try {
       const clipsPayload = segmentsToCut.map((seg) => ({
         id: seg.video.id,
@@ -1105,29 +1287,32 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data?.cuts) && data.cuts.length > 0) {
+          const finalizedCuts = await finalizeClientTrimCutsIfNeeded(data.cuts);
           const targetIdForSingle =
             segmentsToCut.length === 1 ? segmentsToCut[0].targetSceneId : null;
-          onInsertCutYouTubeClips(data.cuts, targetIdForSingle);
+          onInsertCutYouTubeClips(finalizedCuts, targetIdForSingle);
 
           // Update persistent Saved Cuts list so user sees the cut video immediately and can download or re-insert
-          const nextSaved: CutYouTubeResultItem[] = Array.isArray(data?.savedCuts) && data.savedCuts.length > 0
-            ? data.savedCuts
-            : [
-                ...data.cuts,
-                ...savedCuts.filter((sc) => !data.cuts.some((nc: CutYouTubeResultItem) => nc.id === sc.id)),
-              ];
+          const nextSaved: CutYouTubeResultItem[] =
+            Array.isArray(data?.savedCuts) && data.savedCuts.length > 0 && !data.cuts[0]?.clientTrimRequired
+              ? data.savedCuts
+              : [
+                  ...finalizedCuts,
+                  ...savedCuts.filter((sc) => !finalizedCuts.some((nc: CutYouTubeResultItem) => nc.id === sc.id)),
+                ];
           setSavedCuts(nextSaved);
           try {
-            localStorage.setItem('legendcut_saved_cuts_list_v1', JSON.stringify(nextSaved));
+            const persistable = nextSaved.filter((s) => !String(s.videoUrl || '').startsWith('blob:'));
+            localStorage.setItem('legendcut_saved_cuts_list_v1', JSON.stringify(persistable));
           } catch {
             // ignore
           }
 
           const firstCut: CutYouTubeResultItem = {
-            ...data.cuts[0],
+            ...finalizedCuts[0],
             characterName: activeCharName,
             targetSceneId:
-              data.cuts[0].targetSceneId ||
+              finalizedCuts[0].targetSceneId ||
               targetIdForSingle ||
               effectiveScene?.id ||
               scene?.id ||
@@ -1143,14 +1328,14 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
           }
 
           setQueuedSegments([]);
-          const cutSummary = data.cuts
+          const cutSummary = finalizedCuts
             .map(
               (c: CutYouTubeResultItem) =>
                 `${getSceneBadgeById(c.targetSceneId || targetIdForSingle || scene?.id || '')} (${c.originalStartSec}s→${c.originalEndSec}s)`
             )
             .join(', ');
-          const matchedNote = data.cuts[0]?.matchedSourceTitle
-            ? ` [Nguồn MP4 khớp: "${data.cuts[0].matchedSourceTitle}"]`
+          const matchedNote = finalizedCuts[0]?.matchedSourceTitle
+            ? ` [Nguồn MP4 khớp: "${finalizedCuts[0].matchedSourceTitle}"]`
             : '';
           setJustCutBanner(
             `✅ ĐÃ CHẤP NHẬN CẮT & THAY THẾ THÀNH CÔNG (${cutSummary})${matchedNote}! Bạn có thể xem trước đoạn vừa cắt ngay bên dưới, bấm 1-Click để chuyển/gắn sang bất kỳ Phần nào, hoặc tải MP4 về máy!`
@@ -1822,12 +2007,30 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
         {/* Results Body */}
         <div ref={resultsBodyRef} className="flex-1 overflow-y-auto p-5 space-y-5">
           {/* ACCEPTED CUT STUDIO BOX (ĐOẠN CẮT VỪA CHẤP NHẬN — CHỌN PHẦN ĐỂ THAY THẾ NGAY) */}
-          {(latestAcceptedCut || justCutBanner) && (
-            <div className="p-4 rounded-xl bg-gradient-to-r from-emerald-950/95 via-[#0F2422] to-[#0E1B2A] border-2 border-emerald-400 text-emerald-100 space-y-3 shadow-xl">
+          {(latestAcceptedCut || justCutBanner) && (() => {
+            const isWarningBanner =
+              Boolean(justCutBanner) &&
+              /^(⚠️|⏱️|❌)/.test(String(justCutBanner || '').trim());
+            return (
+            <div
+              className={`p-4 rounded-xl border-2 space-y-3 shadow-xl ${
+                isWarningBanner
+                  ? 'bg-gradient-to-r from-amber-950/95 via-rose-950/80 to-[#16131C] border-amber-400 text-amber-100'
+                  : 'bg-gradient-to-r from-emerald-950/95 via-[#0F2422] to-[#0E1B2A] border-emerald-400 text-emerald-100'
+              }`}
+            >
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-start gap-2.5 flex-1 min-w-[260px]">
-                  <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
-                  <div className="text-xs leading-relaxed font-semibold text-emerald-100">
+                  <CheckCircle2
+                    className={`w-5 h-5 shrink-0 mt-0.5 ${
+                      isWarningBanner ? 'text-amber-400' : 'text-emerald-400'
+                    }`}
+                  />
+                  <div
+                    className={`text-xs leading-relaxed font-semibold ${
+                      isWarningBanner ? 'text-amber-100' : 'text-emerald-100'
+                    }`}
+                  >
                     {justCutBanner ||
                       '✅ Đã chấp nhận đoạn cắt! Chọn bất kỳ Phần nào bên dưới để lấy đoạn cắt này thay thế vào ngay.'}
                   </div>
@@ -1959,7 +2162,8 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                 </div>
               )}
             </div>
-          )}
+            );
+          })()}
 
           {/* PERSISTENT SAVED CUTS LIBRARY (KHO VIDEO ĐÃ CẮT & LƯU) */}
           {visibleSavedCuts.length > 0 && (
@@ -2232,80 +2436,114 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                           >
                             <div className="space-y-2">
                               <div className="relative h-40 rounded-md overflow-hidden bg-black border border-slate-800">
-                                <video
-                                  ref={(el) => {
-                                    archivalVideoRefs.current[vid.id] = el;
-                                  }}
-                                  src={cleanVidUrl}
-                                  poster={vid.dataUrl}
-                                  controls
-                                  preload="metadata"
-                                  onLoadedMetadata={(e) => {
-                                    const el = e.currentTarget;
-                                    const dur = Math.floor(el.duration || 0);
-                                    if (dur > 0) {
-                                      setVideoActualDurationSec((prev) => ({
-                                        ...prev,
-                                        [vid.id]: dur,
-                                      }));
-                                      let initStart =
-                                        customTrimStarts[vid.id] ?? vid.trimStartSec ?? 18;
-                                      // Clamp if initial startSec exceeds actual video length (fixes jumping to end 2:44/2:44!)
-                                      if (initStart >= Math.max(4, dur - targetDur - 1)) {
-                                        initStart = Math.max(
-                                          2,
-                                          Math.min(
-                                            Math.max(2, dur - targetDur - 2),
-                                            Math.floor((dur * ((idx % 4) + 1)) / 6)
-                                          )
-                                        );
-                                        setCustomTrimStarts((prev) => ({
+                                {shouldMountInlineVideoScrubber(`arch-${vid.id}`, activeScrubberCardId) ? (
+                                  <video
+                                    ref={(el) => {
+                                      archivalVideoRefs.current[vid.id] = el;
+                                    }}
+                                    src={cleanVidUrl}
+                                    poster={vid.dataUrl}
+                                    controls
+                                    preload="metadata"
+                                    onLoadedMetadata={(e) => {
+                                      const el = e.currentTarget;
+                                      const dur = Math.floor(el.duration || 0);
+                                      if (dur > 0) {
+                                        setVideoActualDurationSec((prev) => ({
+                                          ...prev,
+                                          [vid.id]: dur,
+                                        }));
+                                        let initStart =
+                                          customTrimStarts[vid.id] ?? vid.trimStartSec ?? 18;
+                                        if (initStart >= Math.max(4, dur - targetDur - 1)) {
+                                          initStart = Math.max(
+                                            2,
+                                            Math.min(
+                                              Math.max(2, dur - targetDur - 2),
+                                              Math.floor((dur * ((idx % 4) + 1)) / 6)
+                                            )
+                                          );
+                                          setCustomTrimStarts((prev) => ({
+                                            ...prev,
+                                            [vid.id]: initStart,
+                                          }));
+                                          setCustomTrimEnds((prev) => ({
+                                            ...prev,
+                                            [vid.id]: Math.min(dur, initStart + targetDur),
+                                          }));
+                                        }
+                                        try {
+                                          el.currentTime = initStart;
+                                        } catch {
+                                          // ignore
+                                        }
+                                        setVideoPlayheadSec((prev) => ({
                                           ...prev,
                                           [vid.id]: initStart,
                                         }));
-                                        setCustomTrimEnds((prev) => ({
-                                          ...prev,
-                                          [vid.id]: Math.min(dur, initStart + targetDur),
-                                        }));
+                                        if (previewingArchivalId === vid.id) {
+                                          el.play().catch(() => {});
+                                        }
                                       }
-                                      try {
-                                        el.currentTime = initStart;
-                                      } catch {
-                                        // ignore
+                                    }}
+                                    onTimeUpdate={(e) => {
+                                      const el = e.currentTarget;
+                                      const cur = Math.floor(el.currentTime || 0);
+                                      setVideoPlayheadSec((prev) =>
+                                        prev[vid.id] === cur ? prev : { ...prev, [vid.id]: cur }
+                                      );
+                                      if (
+                                        previewingArchivalId === vid.id &&
+                                        el.currentTime >= endSec
+                                      ) {
+                                        el.pause();
+                                        setPreviewingArchivalId(null);
                                       }
-                                      setVideoPlayheadSec((prev) => ({
-                                        ...prev,
-                                        [vid.id]: initStart,
-                                      }));
-                                    }
-                                  }}
-                                  onTimeUpdate={(e) => {
-                                    const el = e.currentTarget;
-                                    const cur = Math.floor(el.currentTime || 0);
-                                    setVideoPlayheadSec((prev) =>
-                                      prev[vid.id] === cur ? prev : { ...prev, [vid.id]: cur }
-                                    );
-                                    // If user clicked "Xem thử đoạn cắt", auto-pause right at endSec
-                                    if (
-                                      previewingArchivalId === vid.id &&
-                                      el.currentTime >= endSec
-                                    ) {
-                                      el.pause();
-                                      setPreviewingArchivalId(null);
-                                    }
-                                  }}
-                                  className={`w-full h-full ${
-                                    cutFrameMode === '3:4-full-wide'
-                                      ? 'object-contain'
-                                      : 'object-cover'
-                                  } ${
-                                    cutFocusX === 'left'
-                                      ? 'object-left'
-                                      : cutFocusX === 'right'
-                                      ? 'object-right'
-                                      : 'object-center'
-                                  }`}
-                                />
+                                    }}
+                                    className={`w-full h-full ${
+                                      cutFrameMode === '3:4-full-wide'
+                                        ? 'object-contain'
+                                        : 'object-cover'
+                                    } ${
+                                      cutFocusX === 'left'
+                                        ? 'object-left'
+                                        : cutFocusX === 'right'
+                                        ? 'object-right'
+                                        : 'object-center'
+                                    }`}
+                                  />
+                                ) : (
+                                  <div className="relative w-full h-full bg-slate-950 flex items-center justify-center">
+                                    {vid.dataUrl ? (
+                                      <img
+                                        src={vid.dataUrl}
+                                        alt={vid.title}
+                                        className="w-full h-full object-cover opacity-85"
+                                      />
+                                    ) : (
+                                      <div className="flex flex-col items-center justify-center text-slate-400 gap-1">
+                                        <Film className="w-7 h-7 text-sky-400/80" />
+                                        <span className="text-[10px] font-mono text-slate-400">
+                                          MP4 Archive · {startSec}s→{endSec}s
+                                        </span>
+                                      </div>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setPreviewingYtId(null);
+                                        setActiveScrubberCardId(`arch-${vid.id}`);
+                                      }}
+                                      className="absolute inset-0 bg-black/35 hover:bg-black/20 flex items-center justify-center transition-colors group"
+                                      title="Mở trình tua video để xem trước & chọn mốc giây cắt (tối ưu tốc độ cắt)"
+                                    >
+                                      <span className="px-3 py-1.5 rounded-full bg-sky-600 group-hover:bg-sky-500 text-white text-[11px] font-bold flex items-center gap-1.5 shadow-xl">
+                                        <Play className="w-3.5 h-3.5 fill-current" />
+                                        <span>🎛️ Mở Trình Tua ({startSec}s→{endSec}s)</span>
+                                      </span>
+                                    </button>
+                                  </div>
+                                )}
                                 {show34Guide && (
                                   <div className="pointer-events-none absolute inset-y-0 left-1/2 -translate-x-1/2 aspect-[3/4] h-full border-2 border-dashed border-emerald-400/80 shadow-[0_0_0_999px_rgba(0,0,0,0.45)] flex items-end justify-center pb-1">
                                     <span className="px-1.5 py-0.2 rounded bg-emerald-500/90 text-slate-950 text-[9px] font-extrabold">
@@ -2328,6 +2566,10 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                                 <button
                                   type="button"
                                   onClick={() => {
+                                    if (!shouldMountInlineVideoScrubber(`arch-${vid.id}`, activeScrubberCardId)) {
+                                      setActiveScrubberCardId(`arch-${vid.id}`);
+                                      return;
+                                    }
                                     const el = archivalVideoRefs.current[vid.id];
                                     const pickedStart = Math.max(
                                       0,
@@ -2357,6 +2599,12 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                                 <button
                                   type="button"
                                   onClick={() => {
+                                    if (!shouldMountInlineVideoScrubber(`arch-${vid.id}`, activeScrubberCardId)) {
+                                      setPreviewingYtId(null);
+                                      setActiveScrubberCardId(`arch-${vid.id}`);
+                                      setPreviewingArchivalId(vid.id);
+                                      return;
+                                    }
                                     const el = archivalVideoRefs.current[vid.id];
                                     if (!el) return;
                                     if (previewingArchivalId === vid.id && !el.paused) {
@@ -2489,7 +2737,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                             <div className="space-y-1.5">
                               <button
                                 type="button"
-                                disabled={isCuttingThisCard}
+                                disabled={isCuttingYouTube}
                                 onClick={() =>
                                   handleAcceptCutFromReplacementVideo(
                                     vid,
@@ -2538,9 +2786,9 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                                   <Download className="w-3 h-3" />
                                   <span>⬇ Lưu MP4</span>
                                 </a>
-                                  <button
+                                <button
                                   type="button"
-                                  disabled={isCuttingThisCard}
+                                  disabled={isCuttingYouTube}
                                   onClick={() =>
                                     handleAcceptCutFromReplacementVideo(
                                       vid,
@@ -3023,10 +3271,12 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                             Boolean(
                               yt.dmId || yt.tiktokUrl || yt.instagramUrl || yt.archiveMp4Url
                             );
-                          // CRITICAL: Only use direct MP4 scrubber when the card actually has an Archive MP4 URL (never poison Dailymotion/Shorts cards)
-                          const useDirectMp4Scrubber = isShortFormPlatform || isDailymotionCard
-                            ? previewUseDirectMp4[yt.id] === true
-                            : previewUseDirectMp4[yt.id] !== false;
+                          // Strictly mount direct MP4 <video> scrubber ONLY for the single clicked card
+                          // so opening the modal never spawns 30+ concurrent /api/archival/video-stream requests!
+                          const useDirectMp4Scrubber = shouldMountInlineVideoScrubber(
+                            `yt-${yt.id}`,
+                            activeScrubberCardId
+                          );
                           const cleanYtDirectUrl = yt.archiveMp4Url
                             ? `/api/archival/video-stream?url=${encodeURIComponent(
                                 yt.archiveMp4Url
@@ -3172,6 +3422,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                                             type="button"
                                             onClick={() => {
                                               setPreviewingYtId(null);
+                                              setActiveScrubberCardId(`yt-${yt.id}`);
                                               setPreviewUseDirectMp4((prev) => ({
                                                 ...prev,
                                                 [yt.id]: true,
@@ -3209,8 +3460,11 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                                         type="button"
                                         onClick={() => {
                                           if (yt.youtubeId || yt.dmId) {
+                                            setActiveScrubberCardId(null);
                                             setPreviewingYtId(yt.id);
                                           } else if (cleanYtDirectUrl) {
+                                            setPreviewingYtId(null);
+                                            setActiveScrubberCardId(`yt-${yt.id}`);
                                             setPreviewUseDirectMp4((prev) => ({
                                               ...prev,
                                               [yt.id]: true,
@@ -3248,6 +3502,8 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                                           type="button"
                                           onClick={(e) => {
                                             e.stopPropagation();
+                                            setPreviewingYtId(null);
+                                            setActiveScrubberCardId(`yt-${yt.id}`);
                                             setPreviewUseDirectMp4((prev) => ({
                                               ...prev,
                                               [yt.id]: true,
@@ -3601,12 +3857,12 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                               <div className="space-y-1.5">
                                 <button
                                   type="button"
-                                  disabled={isCuttingYouTube && cuttingCardId === yt.id}
+                                  disabled={isCuttingYouTube}
                                   onClick={() => {
                                     if (isCuttingYouTube) return;
                                     handleCutAndInsertYouTubeVideos(yt, false);
                                   }}
-                                  className={`w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-xs font-bold transition-colors ${
+                                  className={`w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-xs font-bold transition-colors disabled:opacity-50 ${
                                     isCuttingYouTube && cuttingCardId === yt.id
                                       ? 'bg-emerald-500 text-slate-950 ring-2 ring-emerald-300'
                                       : 'bg-amber-500 hover:bg-amber-400 text-slate-950 shadow'
@@ -3664,7 +3920,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
 
                                   <button
                                     type="button"
-                                    disabled={isCuttingYouTube && cuttingCardId === yt.id}
+                                    disabled={isCuttingYouTube}
                                     onClick={() => {
                                       if (isCuttingYouTube) return;
                                       handleCutAndInsertYouTubeVideos(yt, true);

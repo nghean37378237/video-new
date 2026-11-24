@@ -64,6 +64,12 @@ import {
   captureRealVideoFrameThumbnail,
   fetchAndAutoTrimActorRealVideos,
 } from './utils/realActorVideoTrimmer';
+import {
+  extractRawArchivalVideoUrl,
+  normalizeCutWindow,
+  resolveModalCharacterName,
+} from './utils/videoCutPlanner';
+import { cutVideoInBrowser } from './utils/clientVideoCutter';
 import { cleanCharacterNameForSearch } from './utils/storyStagePhotoPlanner';
 
 export default function App() {
@@ -1044,6 +1050,140 @@ export default function App() {
       setStatusBanner(
         `🎬 Đã cắt & lưu cố định video đã chọn vào ${assignedLabels.join(', ')} (Bạn cũng có thể bấm "⬇ Lưu MP4" để tải về máy hoặc mở Kho Video Đã Cắt để chèn thay thế)!`
       );
+    }
+  };
+
+  const [isHardCuttingSceneId, setIsHardCuttingSceneId] = useState<string | null>(null);
+
+  const handlePreviewSceneFromStart = (sceneId: string) => {
+    const idx = scenes.findIndex((s) => s.id === sceneId);
+    if (idx < 0) return;
+    const targetSc = scenes[idx];
+    const startSec = scenes
+      .slice(0, idx)
+      .reduce((acc, s) => acc + Math.ceil(s.durationSec || 5), 0);
+    const dur = Math.ceil(targetSc.durationSec || 5);
+    setActiveSceneId(sceneId);
+    setCurrentTimeSec(startSec);
+    setSingleSceneStopTimeSec(startSec + dur);
+    setIsPlaying(true);
+  };
+
+  const handleHardCutSceneVideo = async (
+    sceneToCut: StoryScene,
+    rawStartSec: number,
+    rawEndSec: number
+  ) => {
+    if (!sceneToCut.mediaUrl || isHardCuttingSceneId) return;
+    const win = normalizeCutWindow(rawStartSec, rawEndSec, {
+      defaultDurationSec: Math.round(sceneToCut.durationSec || 8),
+      minDurationSec: 2,
+      maxDurationSec: 35,
+    });
+    const startSec = Math.round(win.startSec);
+    const endSec = Math.round(win.endSec);
+    const durSec = Math.max(2, endSec - startSec);
+
+    setIsHardCuttingSceneId(sceneToCut.id);
+    setStatusBanner(
+      `✂️ Đang cắt cứng đoạn ${startSec}s → ${endSec}s (3:4 HD) cho Cảnh #${String(sceneToCut.order).padStart(2, '0')}...`
+    );
+
+    try {
+      const cleanMediaUrl = String(sceneToCut.mediaUrl || '').split('#')[0];
+      const charName = resolveModalCharacterName({
+        projectTitle: settings.projectTitle,
+        activeSceneNarration: sceneToCut.narrationText,
+        firstSceneNarration: scenes[0]?.narrationText,
+        savedStoryTopic: loadSavedAudioPreferences().storyTopic,
+      });
+
+      let cutResult: CutYouTubeResultItem | null = null;
+
+      // For non-blob sources (Archive stream or saved server MP4), try fast server FFmpeg cut first
+      if (!cleanMediaUrl.startsWith('blob:') && !cleanMediaUrl.startsWith('data:')) {
+        try {
+          const rawUrl = extractRawArchivalVideoUrl(cleanMediaUrl);
+          const res = await fetch('/api/youtube/cut-clips', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              characterName: charName,
+              searchQuery: charName,
+              frameMode: '3:4-sharp',
+              focusX: 'center',
+              clips: [
+                {
+                  id: `scene-recut-${sceneToCut.id}`,
+                  targetSceneId: sceneToCut.id,
+                  title: sceneToCut.realPhotoTitle || sceneToCut.title,
+                  archiveMp4Url: rawUrl,
+                  videoUrl: rawUrl,
+                  thumbnailUrl: sceneToCut.characterRefPhotoUrl || '',
+                  trimStartSec: startSec,
+                  trimEndSec: endSec,
+                  durationSec: durSec,
+                  frameMode: '3:4-sharp',
+                  focusX: 'center',
+                },
+              ],
+            }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data?.cuts) && data.cuts.length > 0 && !data.cuts[0]?.clientTrimRequired) {
+              cutResult = {
+                ...data.cuts[0],
+                targetSceneId: sceneToCut.id,
+                characterName: charName,
+              };
+            }
+          }
+        } catch {
+          // Fall back to in-browser cutter
+        }
+      }
+
+      // Browser-side 3:4 HD cutter fallback (handles local uploaded blob: URLs + Vercel no-FFmpeg!)
+      if (!cutResult) {
+        const browserCut = await cutVideoInBrowser({
+          source: cleanMediaUrl,
+          startSec,
+          endSec,
+          frameMode: '3:4-sharp',
+          focusX: 'center',
+        });
+        cutResult = {
+          id: `scene-browser-cut-${Date.now()}`,
+          targetSceneId: sceneToCut.id,
+          characterName: charName,
+          title: sceneToCut.realPhotoTitle || sceneToCut.title,
+          videoUrl: browserCut.videoUrl,
+          sourceVideoUrl: cleanMediaUrl,
+          thumbnailUrl: browserCut.thumbnailUrl || sceneToCut.characterRefPhotoUrl || '',
+          trimStartSec: browserCut.startSec,
+          trimEndSec: browserCut.endSec,
+          originalStartSec: startSec,
+          originalEndSec: endSec,
+          durationSec: browserCut.durationSec,
+          width: browserCut.width,
+          height: browserCut.height,
+          frameMode: '3:4-sharp',
+          focusX: 'center',
+          sourceLabel:
+            browserCut.mode === 'browser-reencoded'
+              ? `✂️ Đã cắt 3:4 HD trên Trình Duyệt (${startSec}s → ${endSec}s)`
+              : `✂️ Đã khóa đoạn cắt (${startSec}s → ${endSec}s)`,
+        };
+      }
+
+      handleInsertCutYouTubeClips([cutResult], sceneToCut.id);
+    } catch (err: any) {
+      setStatusBanner(
+        `⚠️ Không thể cắt đoạn video hiện tại (${err?.message || 'lỗi đọc luồng video'}). Bạn có thể mở Kho Cắt Video để chọn nguồn khác!`
+      );
+    } finally {
+      setIsHardCuttingSceneId(null);
     }
   };
 
@@ -3840,6 +3980,9 @@ export default function App() {
             onFetchAndInsertTrimmedActorVideos={handleFetchAndInsertTrimmedActorVideos}
             isTrimmingRealVideos={isTrimmingRealVideos}
             onOpenSceneMediaSearch={(sceneId) => setSearchingMediaSceneId(sceneId)}
+            onHardCutSceneVideo={handleHardCutSceneVideo}
+            isHardCuttingSceneId={isHardCuttingSceneId}
+            onPreviewSceneFromStart={handlePreviewSceneFromStart}
           />
         </div>
       </div>
@@ -3889,28 +4032,12 @@ export default function App() {
         activeSceneId={activeSceneId}
         initialTab="youtube"
         totalScenes={scenes.length}
-        characterName={(() => {
-          const firstNarr = scenes[0]?.narrationText || '';
-          const narrMatch = firstNarr.match(/knew the name ([A-Z][a-zA-Z.\s'-]{2,28}?),/);
-          if (narrMatch && narrMatch[1]) {
-            return narrMatch[1].trim();
-          }
-          const savedTopic = (loadSavedAudioPreferences().storyTopic || '').trim();
-          const titlePart = settings.projectTitle.split('—')[0].split('-')[0].trim();
-          if (
-            savedTopic &&
-            (!titlePart || titlePart.toLowerCase() === 'will sampson') &&
-            savedTopic.toLowerCase() !== 'will sampson'
-          ) {
-            return savedTopic;
-          }
-          return (
-            titlePart ||
-            savedTopic ||
-            getCharacterNameForPreset(settings.activePresetId) ||
-            'Clint Eastwood'
-          );
-        })()}
+        characterName={resolveModalCharacterName({
+          projectTitle: settings.projectTitle,
+          activeSceneNarration: activeScene?.narrationText,
+          firstSceneNarration: scenes[0]?.narrationText,
+          savedStoryTopic: loadSavedAudioPreferences().storyTopic,
+        })}
         settings={settings}
         vaultItems={vaultItems}
         onClose={() => setSearchingMediaSceneId(null)}

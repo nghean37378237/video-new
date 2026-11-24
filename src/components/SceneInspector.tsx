@@ -20,6 +20,8 @@ import {
   ExternalLink,
   History,
   Search,
+  Scissors,
+  Play,
 } from 'lucide-react';
 import {
   ColorFilter,
@@ -103,6 +105,9 @@ interface SceneInspectorProps {
   ) => Promise<void>;
   isTrimmingRealVideos?: boolean;
   onOpenSceneMediaSearch?: (sceneId: string) => void;
+  onHardCutSceneVideo?: (scene: StoryScene, startSec: number, endSec: number) => Promise<void>;
+  isHardCuttingSceneId?: string | null;
+  onPreviewSceneFromStart?: (sceneId: string) => void;
 }
 
 export const SceneInspector: React.FC<SceneInspectorProps> = ({
@@ -128,6 +133,9 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
   onFetchAndInsertTrimmedActorVideos,
   isTrimmingRealVideos = false,
   onOpenSceneMediaSearch,
+  onHardCutSceneVideo,
+  isHardCuttingSceneId = null,
+  onPreviewSceneFromStart,
 }) => {
   const [activeTab, setActiveTab] = useState<'scene' | 'summary' | 'thumbnail' | 'style'>('scene');
   const [isGeneratingSceneTTS, setIsGeneratingSceneTTS] = useState(false);
@@ -610,11 +618,111 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
                         : `📸 Ảnh Gốc Tham Chiếu (${ratioSpec.width}×${ratioSpec.height}px)`}
                     </p>
                     <p className="text-[10px] text-slate-400 leading-snug">
-                      Bấm tải ảnh chuẩn kích thước này đưa vào <strong>Grok</strong> hoặc <strong>Kling AI (Image-to-Video)</strong> kèm Prompt bên dưới để tạo video.
+                      {activeScene.mediaKind === 'video'
+                        ? 'Chỉnh giây bắt đầu/kết thúc bên dưới rồi bấm Cắt Cứng 3:4 HD để chốt đoạn video đẹp nhất vào cảnh này.'
+                        : 'Bấm tải ảnh chuẩn kích thước này đưa vào Grok hoặc Kling AI (Image-to-Video) kèm Prompt bên dưới để tạo video.'}
                     </p>
                   </div>
                 </div>
               )}
+
+              {/* Always-Accessible In-Scene Video Trimmer & 3:4 HD Hard Cut */}
+              {activeScene.mediaKind === 'video' && activeScene.mediaUrl && (() => {
+                const startVal = Math.max(0, Math.round(activeScene.videoTrimStartSec || 0));
+                const endVal = Math.max(
+                  startVal + 2,
+                  Math.round(
+                    activeScene.videoTrimEndSec && activeScene.videoTrimEndSec > startVal + 1
+                      ? activeScene.videoTrimEndSec
+                      : startVal + Math.round(activeScene.durationSec || 8)
+                  )
+                );
+                const cutLen = Math.max(2, endVal - startVal);
+                const isCuttingThisScene = isHardCuttingSceneId === activeScene.id;
+                return (
+                  <div className="p-2.5 rounded-lg bg-slate-900/80 border border-amber-500/45 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-bold text-amber-300 flex items-center gap-1">
+                        <Scissors className="w-3.5 h-3.5 text-amber-400" />
+                        <span>✂️ Cắt Đoạn Video Đang Gắn ({cutLen}s)</span>
+                      </span>
+                      {onPreviewSceneFromStart && (
+                        <button
+                          type="button"
+                          onClick={() => onPreviewSceneFromStart(activeScene.id)}
+                          className="px-2 py-0.5 rounded text-[10px] font-bold bg-sky-500/20 hover:bg-sky-500/35 text-sky-200 border border-sky-400/40 flex items-center gap-1 transition-colors"
+                        >
+                          <Play className="w-2.5 h-2.5 fill-current" />
+                          <span>Xem thử</span>
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex items-center justify-between gap-2 text-[11px] font-medium text-slate-200">
+                      <label className="flex items-center gap-1.5">
+                        <span>Từ</span>
+                        <input
+                          type="number"
+                          min={0}
+                          step={1}
+                          value={startVal}
+                          onChange={(e) => {
+                            const nextStart = Math.max(0, parseInt(e.target.value || '0', 10));
+                            onUpdateScene(activeScene.id, {
+                              videoTrimStartSec: nextStart,
+                              videoTrimEndSec: Math.max(nextStart + 2, nextStart + cutLen),
+                            });
+                          }}
+                          className="w-14 px-1.5 py-1 text-center font-mono font-bold bg-slate-950 border border-slate-700 rounded text-amber-300"
+                        />
+                        <span>s</span>
+                      </label>
+                      <span className="text-slate-400 font-bold">→</span>
+                      <label className="flex items-center gap-1.5">
+                        <span>Đến</span>
+                        <input
+                          type="number"
+                          min={startVal + 2}
+                          step={1}
+                          value={endVal}
+                          onChange={(e) => {
+                            const nextEnd = Math.max(
+                              startVal + 2,
+                              parseInt(e.target.value || String(startVal + 8), 10)
+                            );
+                            onUpdateScene(activeScene.id, {
+                              videoTrimStartSec: startVal,
+                              videoTrimEndSec: nextEnd,
+                              durationSec: Math.max(3, Math.min(30, nextEnd - startVal)),
+                            });
+                          }}
+                          className="w-14 px-1.5 py-1 text-center font-mono font-bold bg-slate-950 border border-slate-700 rounded text-emerald-300"
+                        />
+                        <span>s</span>
+                      </label>
+                    </div>
+                    {onHardCutSceneVideo && (
+                      <button
+                        type="button"
+                        disabled={Boolean(isHardCuttingSceneId)}
+                        onClick={() => onHardCutSceneVideo(activeScene, startVal, endVal)}
+                        className="w-full flex items-center justify-center gap-1.5 px-2.5 py-1.5 text-[11px] font-bold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 rounded-md shadow transition-colors"
+                      >
+                        {isCuttingThisScene ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>Đang cắt đoạn {startVal}s→{endVal}s (3:4 HD)...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Scissors className="w-3.5 h-3.5" />
+                            <span>✂️ Cắt Cứng 3:4 HD ({startVal}s → {endVal}s) &amp; Lưu Vào Cảnh</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* Direct 1-Click Upload / Replace New Image or Video into this Scene */}
               {onUploadFileForScene && (

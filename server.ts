@@ -25,6 +25,12 @@ import {
   evaluateCandidateAspectForClearFace,
   readImageDimensionsFromBuffer,
 } from "./src/utils/photoQualityInspector.js";
+import {
+  extractRawArchivalVideoUrl,
+  filterValidSavedCuts,
+  isLikelyRestrictedArchiveUrl,
+  normalizeCutWindow,
+} from "./src/utils/videoCutPlanner.js";
 
 const execFileAsync = promisify(execFile);
 const YT_CUTS_DIR = process.env.VERCEL
@@ -39,12 +45,116 @@ try {
 }
 const SAVED_CUTS_MANIFEST_PATH = path.join(YT_CUTS_DIR, "saved_cuts_manifest.json");
 
+let cachedFfmpegAvailable: boolean | null = null;
+async function checkFfmpegAvailable(): Promise<boolean> {
+  if (cachedFfmpegAvailable !== null) return cachedFfmpegAvailable;
+  try {
+    await execFileAsync("ffmpeg", ["-version"], { timeout: 2500 });
+    cachedFfmpegAvailable = true;
+  } catch {
+    cachedFfmpegAvailable = false;
+  }
+  return cachedFfmpegAvailable;
+}
+
+async function probeRemoteMediaReachable(url: string, timeoutMs = 2600): Promise<boolean> {
+  const clean = extractRawArchivalVideoUrl(url);
+  if (!clean || !clean.startsWith("http")) return false;
+  if (isLikelyRestrictedArchiveUrl(clean)) return false;
+  // HLS playlists (.m3u8) are already resolved directly from Dailymotion player metadata
+  if (/\.m3u8(\?|#|$)/i.test(clean)) return true;
+  try {
+    const resp = await fetch(clean, {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Range: "bytes=0-1",
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    try {
+      resp.body?.cancel();
+    } catch {}
+    if (resp.status === 401 || resp.status === 403 || resp.status === 404 || resp.status >= 500) {
+      return false;
+    }
+    const ctype = (resp.headers.get("content-type") || "").toLowerCase();
+    if (ctype.includes("text/html") || ctype.includes("application/json")) {
+      return false;
+    }
+    return resp.status === 200 || resp.status === 206;
+  } catch {
+    return false;
+  }
+}
+
+function doesLocalCutFileExist(fileName: string): boolean {
+  const safeName = path.basename(String(fileName || "").trim());
+  if (!safeName) return false;
+  const fullPath = path.join(YT_CUTS_DIR, safeName);
+  try {
+    return fs.existsSync(fullPath) && fs.statSync(fullPath).size > 15000;
+  } catch {
+    return false;
+  }
+}
+
+function externalizeCutThumbnail(item: any): { item: any; changed: boolean } {
+  try {
+    const thumb = String(item?.thumbnailUrl || "");
+    const videoUrl = String(item?.videoUrl || "");
+    if (!thumb.startsWith("data:image/") || thumb.length < 2000) {
+      return { item, changed: false };
+    }
+    const base64Idx = thumb.indexOf(";base64,");
+    if (base64Idx < 0) return { item, changed: false };
+    const cleanUrl = videoUrl.split("#")[0].split("?")[0];
+    if (!cleanUrl.startsWith("/api/youtube/cut-file/")) return { item, changed: false };
+    const mp4Name = path.basename(cleanUrl);
+    if (!mp4Name.endsWith(".mp4")) return { item, changed: false };
+    const jpgName = mp4Name.replace(/\.mp4$/i, ".jpg");
+    const jpgPath = path.join(YT_CUTS_DIR, jpgName);
+    if (!fs.existsSync(jpgPath)) {
+      const buf = Buffer.from(thumb.slice(base64Idx + 8), "base64");
+      if (buf.length > 200) {
+        fs.writeFileSync(jpgPath, buf);
+      }
+    }
+    if (fs.existsSync(jpgPath)) {
+      return {
+        item: { ...item, thumbnailUrl: `/api/youtube/cut-file/${jpgName}` },
+        changed: true,
+      };
+    }
+  } catch {
+    // ignore read-only fs or malformed data URL
+  }
+  return { item, changed: false };
+}
+
 function loadSavedCutsManifest(): any[] {
   try {
     if (!fs.existsSync(SAVED_CUTS_MANIFEST_PATH)) return [];
     const raw = fs.readFileSync(SAVED_CUTS_MANIFEST_PATH, "utf-8");
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    const filtered = filterValidSavedCuts(parsed, doesLocalCutFileExist);
+    let mutated = filtered.length !== parsed.length;
+    const cleaned = filtered.map((entry) => {
+      const ext = externalizeCutThumbnail(entry);
+      if (ext.changed) mutated = true;
+      return ext.item;
+    });
+    if (mutated) {
+      try {
+        fs.writeFileSync(SAVED_CUTS_MANIFEST_PATH, JSON.stringify(cleaned, null, 2), "utf-8");
+      } catch {
+        // ignore read-only fs
+      }
+    }
+    return cleaned;
   } catch {
     return [];
   }
@@ -53,8 +163,11 @@ function loadSavedCutsManifest(): any[] {
 function saveCutsToManifest(newCuts: any[]): any[] {
   try {
     const existing = loadSavedCutsManifest();
+    const validNew = filterValidSavedCuts(newCuts, doesLocalCutFileExist).map(
+      (c) => externalizeCutThumbnail(c).item
+    );
     const merged = [
-      ...newCuts.map((c) => ({
+      ...validNew.map((c) => ({
         ...c,
         savedAt: new Date().toLocaleTimeString("vi-VN", {
           hour: "2-digit",
@@ -62,8 +175,8 @@ function saveCutsToManifest(newCuts: any[]): any[] {
           second: "2-digit",
         }),
       })),
-      ...existing.filter((ex) => !newCuts.some((nc) => nc.videoUrl === ex.videoUrl)),
-    ].slice(0, 40);
+      ...existing.filter((ex) => !validNew.some((nc) => nc.videoUrl === ex.videoUrl)),
+    ].slice(0, 35);
     fs.writeFileSync(SAVED_CUTS_MANIFEST_PATH, JSON.stringify(merged, null, 2), "utf-8");
     return merged;
   } catch {
@@ -4480,6 +4593,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
               const rawMp4Url = `https://archive.org/download/${encodeURIComponent(
                 identifier
               )}/${encodeURIComponent(chosenFile.name).replace(/%2F/g, "/")}`;
+              if (isLikelyRestrictedArchiveUrl(rawMp4Url)) return null;
               return {
                 rawMp4Url,
                 title: docTitle.slice(0, 56),
@@ -4605,14 +4719,24 @@ For every scene, ensure smooth chronological transitions from one scene to the n
 
   // 2d. CORS & HTTP Range Video Stream Proxy for Internet Archive & Wikimedia Commons real video cuts
   app.get("/api/archival/video-stream", async (req, res) => {
+    const abortCtrl = new AbortController();
+    const headerTimer = setTimeout(() => abortCtrl.abort(), 14000);
+    const onClientClose = () => {
+      clearTimeout(headerTimer);
+      abortCtrl.abort();
+    };
+    req.on("close", onClientClose);
+
     try {
       const targetUrl = String(req.query.url || "").trim();
       if (
         !targetUrl ||
         (!targetUrl.startsWith("https://archive.org/") &&
           !targetUrl.includes(".archive.org/") &&
-          !targetUrl.includes("wikimedia.org/"))
+          !targetUrl.includes("wikimedia.org/")) ||
+        isLikelyRestrictedArchiveUrl(targetUrl)
       ) {
+        clearTimeout(headerTimer);
         res.status(400).send("Invalid archival video URL");
         return;
       }
@@ -4627,7 +4751,14 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       const upstream = await fetch(targetUrl, {
         headers,
         redirect: "follow",
+        signal: abortCtrl.signal,
       });
+      clearTimeout(headerTimer);
+
+      if (abortCtrl.signal.aborted || res.writableEnded) {
+        upstream.body?.cancel().catch(() => {});
+        return;
+      }
 
       res.status(upstream.status);
       res.setHeader("Access-Control-Allow-Origin", "*");
@@ -4651,14 +4782,25 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         return;
       }
       const reader = upstream.body.getReader();
-      req.on("close", () => {
+      req.once("close", () => {
         reader.cancel().catch(() => {});
       });
       while (true) {
+        if (abortCtrl.signal.aborted || res.writableEnded) {
+          reader.cancel().catch(() => {});
+          break;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         if (!res.writableEnded) {
-          res.write(Buffer.from(value));
+          const ok = res.write(Buffer.from(value));
+          if (!ok) {
+            await new Promise<void>((resolve) => {
+              const doneWait = () => resolve();
+              res.once("drain", doneWait);
+              res.once("close", doneWait);
+            });
+          }
         } else {
           break;
         }
@@ -4667,11 +4809,14 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         res.end();
       }
     } catch {
+      clearTimeout(headerTimer);
       if (!res.headersSent) {
         res.status(502).end();
       } else if (!res.writableEnded) {
         res.end();
       }
+    } finally {
+      req.off("close", onClientClose);
     }
   });
 
@@ -4752,6 +4897,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         ? VERIFIED_ACTOR_REAL_VIDEO_REELS[matchedCuratedKey]
         : [];
 
+      const ffmpegReady = await checkFfmpegAvailable();
       const totalTargets = Math.max(desiredCount, Math.min(desiredCount, dmCandidates.length || videos.length));
       const videoCutsRaw = await Promise.all(
         Array.from({ length: totalTargets }).map(async (_, idx) => {
@@ -4767,6 +4913,32 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           const dmCand = dmCandidates[idx % Math.max(1, dmCandidates.length)];
           const archVid = videos[idx % Math.max(1, videos.length)];
           const curatedReel = curatedReels[idx % Math.max(1, curatedReels.length)];
+
+          // Graceful serverless/Vercel fallback when FFmpeg is absent: return direct playable proxied Archive MP4 with trim window
+          if (!ffmpegReady) {
+            const archRawMatch = archVid?.videoUrl?.match(/[?&]url=([^&#]+)/);
+            const archRawUrl = archRawMatch
+              ? decodeURIComponent(archRawMatch[1])
+              : curatedReel?.rawMp4Url || "";
+            if (archRawUrl && !/\.ogv(\?|#|$)/i.test(archRawUrl) && (await probeRemoteMediaReachable(archRawUrl))) {
+              const startSec = 20 + ((idx * 19 + Number(cycleOffset || 0) * 13) % 85);
+              return {
+                title: archVid?.title || curatedReel?.title || cleanQuery,
+                videoUrl: `/api/archival/video-stream?url=${encodeURIComponent(archRawUrl)}#cut=${idx + 1}&seg=${startSec}-${startSec + dur}`,
+                dataUrl: archVid?.dataUrl || distinctPhoto?.dataUrl || "",
+                trimStartSec: startSec,
+                trimEndSec: startSec + dur,
+                durationSec: dur,
+                originalStartSec: startSec,
+                originalEndSec: startSec + dur,
+                width: 720,
+                height: 960,
+                clientTrimRequired: true,
+                sourceLabel: `✂️ Cắt Trực Tiếp Trình Duyệt (${startSec}s → ${startSec + dur}s)`,
+              };
+            }
+            return null;
+          }
 
           const cutMp4File = async (srcUrl: string, startSec: number, tagIdx: number) => {
             const fileId = `arch_cut_${Date.now()}_${tagIdx}_${startSec}s_${startSec + dur}s`;
@@ -4810,7 +4982,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                   "-an",
                   outMp4Path,
                 ],
-                { timeout: 14500 }
+                { timeout: 18500 }
               );
               if (fs.existsSync(outMp4Path) && fs.statSync(outMp4Path).size > 20000) {
                 await execFileAsync(
@@ -4870,10 +5042,10 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             }
           }
 
-          // 2. Try Archive.org / Wikimedia MP4 stream
+          // 2. Try Archive.org / Wikimedia MP4 stream (probe fast first to skip 401/403/503)
           const archRawMatch = archVid?.videoUrl?.match(/[?&]url=([^&#]+)/);
           const archRawUrl = archRawMatch ? decodeURIComponent(archRawMatch[1]) : curatedReel?.rawMp4Url || "";
-          if (archRawUrl && !/\.ogv(\?|#|$)/i.test(archRawUrl)) {
+          if (archRawUrl && !/\.ogv(\?|#|$)/i.test(archRawUrl) && (await probeRemoteMediaReachable(archRawUrl))) {
             const startSec = 22 + ((idx * 19 + Number(cycleOffset || 0) * 13) % 90);
             const cutRes = await cutMp4File(archRawUrl, startSec, idx);
             if (cutRes) {
@@ -4900,8 +5072,10 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       const videoCuts = videoCutsRaw.filter((v): v is NonNullable<typeof v> => Boolean(v));
 
       res.json({
+        mode: ffmpegReady ? "server-ffmpeg" : "client-trim",
         videoCuts,
-        verifiedPhotos: combinedPhotos,
+        // Cap photos to 8 compact items so JSON stays well under Vercel's 4.5MB response limit
+        verifiedPhotos: combinedPhotos.slice(0, 8),
         searchedQuery: cleanQuery,
       });
     } catch (error: any) {
@@ -5155,18 +5329,26 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     }
   });
 
-  // 2g. Serve FFmpeg-Cut MP4 Clips from public/saved_cuts (with ?download=1 support to save MP4 to computer)
+  // 2g. Serve FFmpeg-Cut MP4 Clips & Externalized JPG Thumbnails from public/saved_cuts
   app.get("/api/youtube/cut-file/:filename", (req, res) => {
     const safeName = path.basename(String(req.params.filename || ""));
     let fullPath = path.join(YT_CUTS_DIR, safeName);
     if (!fs.existsSync(fullPath) && fs.existsSync(path.join("/tmp/yt_cuts", safeName))) {
       fullPath = path.join("/tmp/yt_cuts", safeName);
     }
-    if (!safeName.endsWith(".mp4") || !fs.existsSync(fullPath)) {
+    const isMp4 = safeName.endsWith(".mp4");
+    const isJpg = safeName.endsWith(".jpg") || safeName.endsWith(".jpeg");
+    if ((!isMp4 && !isJpg) || !fs.existsSync(fullPath)) {
       res.status(404).send("Cut clip not found");
       return;
     }
     res.setHeader("Access-Control-Allow-Origin", "*");
+    if (isJpg) {
+      res.setHeader("Content-Type", "image/jpeg");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.sendFile(fullPath);
+      return;
+    }
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Accept-Ranges", "bytes");
     if (req.query.download === "1") {
@@ -6557,9 +6739,12 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         ? VERIFIED_ACTOR_REAL_VIDEO_REELS[matchedCuratedKey]
         : [];
 
-      const hasSocialClipUrl = clips.some((c: any) =>
-        Boolean(c?.tiktokUrl || c?.instagramUrl || ((c?.youtubeUrl || c?.youtubeId) && Date.now() - lastYtDlpYouTubeBlockedAt >= 15 * 60 * 1000))
-      );
+      const ffmpegReady = await checkFfmpegAvailable();
+      const hasSocialClipUrl =
+        ffmpegReady &&
+        clips.some((c: any) =>
+          Boolean(c?.tiktokUrl || c?.instagramUrl || ((c?.youtubeUrl || c?.youtubeId) && Date.now() - lastYtDlpYouTubeBlockedAt >= 15 * 60 * 1000))
+        );
       const ytDlpBin = hasSocialClipUrl ? await ensureYtDlpBinary() : null;
 
       const isHtmlSocialPageUrl = (u: string): boolean =>
@@ -6567,8 +6752,9 @@ For every scene, ensure smooth chronological transitions from one scene to the n
 
       const isPlayableDirectMediaUrl = (u: string): boolean =>
         Boolean(u) &&
-        u.startsWith("http") &&
-        (!isHtmlSocialPageUrl(u) || /\.(mp4|m3u8|webm|mov)(\?|#|$)/i.test(u));
+        (u.startsWith("/api/youtube/cut-file/") ||
+          (u.startsWith("http") &&
+            (!isHtmlSocialPageUrl(u) || /\.(mp4|m3u8|webm|mov)(\?|#|$)/i.test(u))));
 
       const isSupportedArchivalProxyTarget = (u: string): boolean =>
         u.startsWith("https://archive.org/") ||
@@ -6921,14 +7107,13 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       let nextClipCursor = 0;
 
       const processSingleClip = async (clip: any, idx: number) => {
-          const parsedStart = Number(clip?.trimStartSec);
-          const trimStartSec =
-            Number.isFinite(parsedStart) && parsedStart >= 0 ? Math.round(parsedStart) : 12;
-          const rawEndSec = Number(clip?.trimEndSec);
-          const durationSec =
-            rawEndSec && rawEndSec > trimStartSec + 1
-              ? Math.max(3, Math.min(25, Math.round(rawEndSec - trimStartSec)))
-              : Math.max(3, Math.min(25, Math.round(Number(clip?.durationSec) || 8)));
+          const win = normalizeCutWindow(
+            Number(clip?.trimStartSec ?? 12),
+            Number(clip?.trimEndSec ?? (Number(clip?.trimStartSec ?? 12) + (Number(clip?.durationSec) || 8))),
+            { defaultDurationSec: Number(clip?.durationSec) || 8, minDurationSec: 3, maxDurationSec: 35 }
+          );
+          const trimStartSec = Math.round(win.startSec);
+          const durationSec = Math.max(3, Math.min(35, Math.round(win.durationSec)));
           const trimEndSec = trimStartSec + durationSec;
           const title = String(clip?.title || `${cleanChar} — Đoạn Cắt #${idx + 1}`);
           const targetSceneId = clip?.targetSceneId ? String(clip.targetSceneId) : undefined;
@@ -6937,8 +7122,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           const youtubeUrl = String(
             clip?.youtubeUrl || (clip?.youtubeId ? `https://www.youtube.com/watch?v=${clip.youtubeId}` : "")
           ).trim();
-          const videoUrlOpt = String(clip?.videoUrl || "").trim();
-          const explicitArchiveMp4 = String(clip?.archiveMp4Url || "").trim();
+          const videoUrlOpt = extractRawArchivalVideoUrl(String(clip?.videoUrl || "").trim());
+          const explicitArchiveMp4 = extractRawArchivalVideoUrl(String(clip?.archiveMp4Url || "").trim());
 
           const clipFrameMode = String(clip?.frameMode || reqFrameMode || "3:4-sharp");
           const clipFocusX = String(clip?.focusX || reqFocusX || "center");
@@ -6958,10 +7143,66 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           let matchedSourceTitle = "";
 
           const directCandidate = [explicitArchiveMp4, videoUrlOpt].find(
-            (u) => isPlayableDirectMediaUrl(u) && !/\.ogv(\?|#|$)/i.test(u)
+            (u) => isPlayableDirectMediaUrl(u) && !/\.ogv(\?|#|$)/i.test(u) && !isLikelyRestrictedArchiveUrl(u)
           ) || "";
           const socialUrl = tiktokUrl || instagramUrl || youtubeUrl;
           const explicitDmId = String(clip?.dmId || "").trim();
+
+          // SERVERLESS / VERCEL MODE (No FFmpeg): Resolve playable MP4 stream so the browser cuts cleanly in 3:4 HD!
+          if (!ffmpegReady) {
+            let playableRaw = "";
+            if (directCandidate && (await probeRemoteMediaReachable(directCandidate))) {
+              playableRaw = directCandidate;
+            }
+            if (!playableRaw) {
+              const liveArch = await searchRealArchivalVideos(
+                dmSubjectAnchor,
+                4,
+                new Set<string>(),
+                String(characterName || "").trim() || cleanChar
+              ).catch(() => []);
+              for (const cand of liveArch) {
+                const raw = extractRawArchivalVideoUrl(cand.videoUrl);
+                if (raw && !/\.ogv(\?|#|$)/i.test(raw) && (await probeRemoteMediaReachable(raw))) {
+                  playableRaw = raw;
+                  matchedSourceTitle = cand.title;
+                  break;
+                }
+              }
+            }
+            if (!playableRaw && curatedReels.length > 0) {
+              const picked = curatedReels[idx % curatedReels.length];
+              if (picked?.rawMp4Url && (await probeRemoteMediaReachable(picked.rawMp4Url))) {
+                playableRaw = picked.rawMp4Url;
+                matchedSourceTitle = picked.title;
+              }
+            }
+            if (!playableRaw) return null;
+            const streamUrl = isSupportedArchivalProxyTarget(playableRaw)
+              ? `/api/archival/video-stream?url=${encodeURIComponent(playableRaw)}#cut=${idx + 1}&seg=${trimStartSec}-${trimEndSec}`
+              : playableRaw;
+            return {
+              id: `yt-cut-${Date.now()}-${idx}`,
+              targetSceneId,
+              characterName: cleanChar,
+              title: matchedSourceTitle && matchedSourceTitle !== title ? `${title} · [Nguồn: ${matchedSourceTitle}]` : title,
+              matchedSourceTitle: matchedSourceTitle || undefined,
+              videoUrl: streamUrl,
+              sourceVideoUrl: playableRaw,
+              thumbnailUrl: String(clip?.thumbnailUrl || ""),
+              trimStartSec,
+              trimEndSec,
+              originalStartSec: trimStartSec,
+              originalEndSec: trimEndSec,
+              durationSec,
+              width: 720,
+              height: 960,
+              frameMode: clipFrameMode,
+              focusX: clipFocusX,
+              clientTrimRequired: true,
+              sourceLabel: `✂️ Cắt Chuẩn 3:4 HD Trình Duyệt (${trimStartSec}s → ${trimEndSec}s)`,
+            };
+          }
 
           // 1. PRIORITY 1: Exact TikTok / Instagram URL -> download real MP4 via yt-dlp & cut exact [start -> end] with FFmpeg
           const directSocialTarget = tiktokUrl || instagramUrl;
@@ -7005,28 +7246,41 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             }
           }
 
-          // 3. PRIORITY 3: Exact Direct MP4/WebM URL (Archive.org / Wikimedia WebM / Uploaded)
+          // 3. PRIORITY 3: Exact Direct MP4/WebM URL (Archive.org / Wikimedia WebM / Local Cut File)
           if (!cutSucceeded && directCandidate) {
-            usedSourceUrl = directCandidate;
-            cutSucceeded = await runFastFfmpegCut(
-              directCandidate,
-              trimStartSec,
-              durationSec,
-              vf34Filter,
-              outMp4Path,
-              outJpgPath,
-              14000
-            );
-            if (!cutSucceeded && trimStartSec > 45) {
+            const isLocalCutFile = directCandidate.includes("/api/youtube/cut-file/");
+            let ffmpegInput = directCandidate;
+            let reachable = true;
+            if (isLocalCutFile) {
+              const localName = path.basename(directCandidate.split("/api/youtube/cut-file/")[1].split(/[?#]/)[0]);
+              const localDiskPath = path.join(YT_CUTS_DIR, localName);
+              reachable = fs.existsSync(localDiskPath) && fs.statSync(localDiskPath).size > 15000;
+              if (reachable) ffmpegInput = localDiskPath;
+            } else {
+              reachable = await probeRemoteMediaReachable(directCandidate);
+            }
+            if (reachable) {
+              usedSourceUrl = directCandidate;
               cutSucceeded = await runFastFfmpegCut(
-                directCandidate,
-                Math.min(18, trimStartSec % 28),
+                ffmpegInput,
+                trimStartSec,
                 durationSec,
                 vf34Filter,
                 outMp4Path,
                 outJpgPath,
-                12000
+                20000
               );
+              if (!cutSucceeded && trimStartSec > 45) {
+                cutSucceeded = await runFastFfmpegCut(
+                  ffmpegInput,
+                  Math.min(18, trimStartSec % 28),
+                  durationSec,
+                  vf34Filter,
+                  outMp4Path,
+                  outJpgPath,
+                  16000
+                );
+              }
             }
           }
 
@@ -7118,6 +7372,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
               );
             for (const archCand of liveMp4s.slice(0, 2)) {
               if (cutSucceeded) break;
+              if (!(await probeRemoteMediaReachable(archCand.url))) continue;
               usedSourceUrl = archCand.url;
               const safeSeek = Math.max(18, Math.min(60, trimStartSec));
               cutSucceeded = await runFastFfmpegCut(
@@ -7127,7 +7382,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 vf34Filter,
                 outMp4Path,
                 outJpgPath,
-                15000
+                18000
               );
               if (cutSucceeded) {
                 matchedSourceTitle = archCand.title;
@@ -7250,6 +7505,16 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     async (req, res) => {
       const tmpInput = path.join("/tmp", `upload_cut_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.mp4`);
       try {
+        const ffmpegReady = await checkFfmpegAvailable();
+        if (!ffmpegReady) {
+          res.json({
+            mode: "client-trim",
+            clientTrimRequired: true,
+            cuts: [],
+            savedCuts: loadSavedCutsManifest(),
+          });
+          return;
+        }
         const bodyBuf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || "");
         if (!bodyBuf || bodyBuf.length < 10000) {
           res.status(400).json({ error: "File video tải lên không hợp lệ hoặc bị trống." });
@@ -7258,8 +7523,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         fs.writeFileSync(tmpInput, bodyBuf);
 
         const startSec = Math.max(0, Math.round(Number(req.query.startSec) || 0));
-        const endSec = Math.max(startSec + 3, Math.round(Number(req.query.endSec) || startSec + 10));
-        const durSec = Math.max(3, Math.min(25, endSec - startSec));
+        const endSec = Math.max(startSec + 2, Math.round(Number(req.query.endSec) || startSec + 10));
+        const durSec = Math.max(2, Math.min(35, endSec - startSec));
         const frameMode = String(req.query.frameMode || "3:4-sharp");
         const focusX = String(req.query.focusX || "center");
         const targetSceneId = req.query.targetSceneId ? String(req.query.targetSceneId) : undefined;
