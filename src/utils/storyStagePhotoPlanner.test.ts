@@ -5,6 +5,7 @@ import {
   classifySceneStoryStage,
   cleanCharacterNameForSearch,
   extractHistoricalPhotoYear,
+  isGenericOrNonFacePhoto,
   isSpamOrNonCharacterPhoto,
   matchesCharacterPhotoIdentity,
   rankAndAssignStagePhotosToScenes,
@@ -81,7 +82,7 @@ test('classifySceneStoryStage detects distinct narrative stages and years', () =
 
   const rodeo = classifySceneStoryStage(sampleWillSampsonScenes[2], 2, 6, 'Will Sampson');
   assert.equal(rodeo.stage, 'breakthrough');
-  assert.equal(rodeo.allowContextualMultiPerson, true);
+  assert.equal(rodeo.allowContextualMultiPerson, false);
 
   const painter = classifySceneStoryStage(sampleWillSampsonScenes[3], 3, 6, 'Will Sampson');
   assert.equal(painter.stage, 'personal-behind-scenes');
@@ -268,4 +269,49 @@ test('extractHistoricalPhotoYear ignores birth-death lifespans and modern articl
     null
   );
 });
+
+test('isGenericOrNonFacePhoto blocks split-screen collages, then-and-now comparisons, and distant crowd/back-view shots', () => {
+  assert.equal(isGenericOrNonFacePhoto('Dolly Parton Then and Now Transformation'), true);
+  assert.equal(isGenericOrNonFacePhoto('Dolly Parton before and after side by side split screen'), true);
+  assert.equal(isGenericOrNonFacePhoto('Dolly Parton concert crowd stage wide shot'), true);
+  assert.equal(isGenericOrNonFacePhoto('Singer back view silhouette on full stage'), true);
+  assert.equal(isGenericOrNonFacePhoto('Dolly Parton solo studio portrait closeup 1977'), false);
+});
+
+test('rankAndAssignStagePhotosToScenes strongly prefers clear solo portrait over wide generic stage photo', () => {
+  const scenes: StorySceneSummaryInput[] = [
+    {
+      id: 'd1',
+      order: 1,
+      title: 'Giọng ca vàng Dolly Parton',
+      sceneType: 'image',
+      narrationText: 'Dolly Parton smiled warmly under the spotlight.',
+      archivalKeywords: 'Dolly Parton singer',
+    },
+  ];
+  const pool: VerifiedStagePhotoCandidate[] = [
+    {
+      title: 'Dolly Parton concert stage wide shot crowd',
+      dataUrl: 'data:image/jpeg;base64,WIDE_GENERIC',
+      sourceUrl: 'https://example.com/stage-wide.jpg',
+      width: 1600,
+      height: 900,
+      year: 1978,
+      stage: 'peak-cinema',
+    },
+    {
+      title: 'Dolly Parton solo studio portrait closeup face',
+      dataUrl: 'data:image/jpeg;base64,CLEAR_PORTRAIT',
+      sourceUrl: 'https://example.com/portrait-closeup.jpg',
+      width: 800,
+      height: 1066,
+      year: 1978,
+      stage: 'peak-cinema',
+    },
+  ];
+
+  const res = rankAndAssignStagePhotosToScenes(scenes, pool, 'Dolly Parton');
+  assert.equal(res.assignedBySceneId['d1']?.dataUrl, 'data:image/jpeg;base64,CLEAR_PORTRAIT');
+});
+
 

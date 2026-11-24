@@ -12,6 +12,7 @@ import {
   classifySceneStoryStage,
   cleanCharacterNameForSearch,
   extractHistoricalPhotoYear,
+  isGenericOrNonFacePhoto,
   isSpamOrNonCharacterPhoto,
   matchesCharacterPhotoIdentity,
   rankAndAssignStagePhotosToScenes,
@@ -19,6 +20,11 @@ import {
   type StoryPhotoStageId,
   type VerifiedStagePhotoCandidate,
 } from "./src/utils/storyStagePhotoPlanner.js";
+import {
+  analyzeRawRgbForSplitOrBadFraming,
+  evaluateCandidateAspectForClearFace,
+  readImageDimensionsFromBuffer,
+} from "./src/utils/photoQualityInspector.js";
 
 const execFileAsync = promisify(execFile);
 const YT_CUTS_DIR = process.env.VERCEL
@@ -2523,13 +2529,15 @@ For every scene, ensure smooth chronological transitions from one scene to the n
   ): Promise<{ isCollage: boolean; reason?: string }> {
     return new Promise((resolve) => {
       try {
+        const W = 128;
+        const H = 128;
         const p = spawn("ffmpeg", [
           "-v",
           "error",
           "-i",
           "pipe:0",
           "-vf",
-          "scale=72:96",
+          `scale=${W}:${H}`,
           "-frames:v",
           "1",
           "-f",
@@ -2549,70 +2557,12 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         p.on("close", () => {
           clearTimeout(timer);
           const raw = Buffer.concat(chunks);
-          const W = 72;
-          const H = 96;
           if (raw.length < W * H * 3) return resolve({ isCollage: false });
-          const lum = (x: number, y: number) => {
-            const i = (y * W + x) * 3;
-            return 0.299 * raw[i] + 0.587 * raw[i + 1] + 0.114 * raw[i + 2];
-          };
-          let maxVertEdgeFrac = 0;
-          let hasSolidVertBar = false;
-          for (let x = 16; x <= 56; x++) {
-            let edgeCount = 0;
-            let sum = 0;
-            let sumSq = 0;
-            let adjDiff = 0;
-            for (let y = 4; y < H - 4; y++) {
-              const v = lum(x, y);
-              sum += v;
-              sumSq += v * v;
-              const d = Math.abs(lum(x + 1, y) - lum(x - 1, y));
-              const leftSmooth = Math.abs(lum(x - 1, y) - lum(x - 2, y));
-              const rightSmooth = Math.abs(lum(x + 2, y) - lum(x + 1, y));
-              if (d > 24 && d > (leftSmooth + rightSmooth) * 1.4 + 10) edgeCount++;
-              adjDiff += Math.abs(v - lum(x - 2, y)) + Math.abs(v - lum(x + 2, y));
-            }
-            const n = H - 8;
-            const mean = sum / n;
-            const std = Math.sqrt(Math.max(0, sumSq / n - mean * mean));
-            if (std < 9 && adjDiff / (2 * n) > 18) hasSolidVertBar = true;
-            maxVertEdgeFrac = Math.max(maxVertEdgeFrac, edgeCount / n);
-          }
-
-          let maxHorizEdgeFrac = 0;
-          let hasSolidHorizBar = false;
-          for (let y = 22; y <= 74; y++) {
-            let edgeCount = 0;
-            let sum = 0;
-            let sumSq = 0;
-            let adjDiff = 0;
-            for (let x = 4; x < W - 4; x++) {
-              const v = lum(x, y);
-              sum += v;
-              sumSq += v * v;
-              const d = Math.abs(lum(x, y + 1) - lum(x, y - 1));
-              const topSmooth = Math.abs(lum(x, y - 1) - lum(x, y - 2));
-              const botSmooth = Math.abs(lum(x, y + 2) - lum(x, y + 1));
-              if (d > 24 && d > (topSmooth + botSmooth) * 1.4 + 10) edgeCount++;
-              adjDiff += Math.abs(v - lum(x, y - 2)) + Math.abs(v - lum(x, y + 2));
-            }
-            const n = W - 8;
-            const mean = sum / n;
-            const std = Math.sqrt(Math.max(0, sumSq / n - mean * mean));
-            if (std < 9 && adjDiff / (2 * n) > 18) hasSolidHorizBar = true;
-            maxHorizEdgeFrac = Math.max(maxHorizEdgeFrac, edgeCount / n);
-          }
-
-          if (
-            hasSolidVertBar ||
-            hasSolidHorizBar ||
-            maxVertEdgeFrac >= 0.72 ||
-            maxHorizEdgeFrac >= 0.72
-          ) {
+          const analysis = analyzeRawRgbForSplitOrBadFraming(raw, W, H);
+          if (analysis.isSplitCollage) {
             return resolve({
               isCollage: true,
-              reason: `seam-detected(v=${maxVertEdgeFrac.toFixed(2)},h=${maxHorizEdgeFrac.toFixed(2)})`,
+              reason: analysis.reason,
             });
           }
           resolve({ isCollage: false });
@@ -2625,12 +2575,19 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     });
   }
 
-  async function resolveImageToDataUrlOrDirect(
+  async function resolveVerifiedPortraitImage(
     primaryUrl: string,
     fallbackThumbUrl?: string,
-    rejectCollagePixels = false
-  ): Promise<string | null> {
+    options: {
+      rejectCollagePixels?: boolean;
+      enforceClearFaceAspect?: boolean;
+      allowClassicWideStill?: boolean;
+    } = {}
+  ): Promise<{ dataUrl: string; width: number | null; height: number | null } | null> {
+    const rejectCollagePixels = options.rejectCollagePixels ?? true;
+    const enforceClearFaceAspect = options.enforceClearFaceAspect ?? true;
     const urlsToTry = [primaryUrl, fallbackThumbUrl].filter(Boolean) as string[];
+
     for (const targetUrl of urlsToTry) {
       try {
         const controller = new AbortController();
@@ -2656,13 +2613,32 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             const ab = await imgRes.arrayBuffer();
             if (ab.byteLength > 4500) {
               const buf = Buffer.from(ab);
+              const realDims = readImageDimensionsFromBuffer(buf);
+
+              if (enforceClearFaceAspect && realDims) {
+                const aspectEval = evaluateCandidateAspectForClearFace(
+                  realDims.width,
+                  realDims.height,
+                  "3:4",
+                  { allowClassicWideStill: options.allowClassicWideStill }
+                );
+                if (!aspectEval.ok) {
+                  continue;
+                }
+              }
+
               if (rejectCollagePixels) {
                 const check = await detectCollageOrCompositeImage(buf);
                 if (check.isCollage) {
                   return null;
                 }
               }
-              return `data:${cType};base64,${buf.toString("base64")}`;
+
+              return {
+                dataUrl: `data:${cType};base64,${buf.toString("base64")}`,
+                width: realDims?.width ?? null,
+                height: realDims?.height ?? null,
+              };
             }
           }
         }
@@ -2670,6 +2646,19 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         // Try next URL in urlsToTry
       }
     }
+    return null;
+  }
+
+  async function resolveImageToDataUrlOrDirect(
+    primaryUrl: string,
+    fallbackThumbUrl?: string,
+    rejectCollagePixels = false
+  ): Promise<string | null> {
+    const resolved = await resolveVerifiedPortraitImage(primaryUrl, fallbackThumbUrl, {
+      rejectCollagePixels,
+      enforceClearFaceAspect: rejectCollagePixels,
+    });
+    if (resolved) return resolved.dataUrl;
     return rejectCollagePixels ? null : fallbackThumbUrl || primaryUrl;
   }
 
@@ -2861,19 +2850,32 @@ For every scene, ensure smooth chronological transitions from one scene to the n
   >();
 
   async function runBingImageSearchCached(
-    query: string
+    query: string,
+    options: { facePortrait?: boolean; tallAspect?: boolean } = {}
   ): Promise<
     Array<{ title: string; imageUrl: string; thumbUrl: string; pageUrl: string; width: number; height: number }>
   > {
-    const cacheKey = query.toLowerCase().trim();
-    if (!cacheKey) return [];
+    const useFacePortrait = options.facePortrait !== false;
+    const useTallAspect = Boolean(options.tallAspect);
+    const cacheKey = `${query.toLowerCase().trim()}|fp=${useFacePortrait ? 1 : 0}|tall=${useTallAspect ? 1 : 0}`;
+    if (!query.trim()) return [];
     if (bingImageCache.has(cacheKey)) {
       return bingImageCache.get(cacheKey)!;
     }
     try {
+      const qftParts: string[] = [];
+      if (useFacePortrait) qftParts.push("+filterui:face-portrait");
+      qftParts.push("+filterui:photo-photo");
+      if (useTallAspect) qftParts.push("+filterui:aspect-tall");
+      const qftParam = qftParts.length > 0 ? `&qft=${encodeURIComponent(qftParts.join(""))}` : "";
+
+      const stockExclusions =
+        "-site:gettyimages.com -site:alamy.com -site:shutterstock.com -site:istockphoto.com -site:dreamstime.com -site:123rf.com";
+      const fullQuery = `${query} ${stockExclusions}`.trim();
+
       const url = `https://www.bing.com/images/search?q=${encodeURIComponent(
-        query
-      )}&form=HDRSC2&first=1&tsc=ImageBasicHover`;
+        fullQuery
+      )}${qftParam}&form=HDRSC2&first=1&tsc=ImageBasicHover`;
       const res = await fetch(url, {
         headers: {
           "User-Agent": BROWSER_USER_AGENT,
@@ -2915,8 +2917,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             imageUrl,
             thumbUrl,
             pageUrl,
-            width: Number(parsed?.w) || 800,
-            height: Number(parsed?.h) || 960,
+            width: Number(parsed?.w) || 0,
+            height: Number(parsed?.h) || 0,
           });
         } catch {
           // ignore malformed card JSON
@@ -2929,7 +2931,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     }
   }
 
-  // Helper: Search Verified Rich Character Photo Sources (IMDb Person CDN, TVMaze, Wikipedia media-list, Wikimedia Commons Search + Category, Bing Images, Openverse, and rate-guarded DuckDuckGo)
+  // Helper: Search Verified Rich Character Photo Sources (IMDb Person CDN, TVMaze, Wikipedia media-list, Wikimedia Commons Search + Category, Bing Face-Portrait Images, Openverse, and rate-guarded DuckDuckGo)
   async function searchRealArchivalPhotos(
     rawQuery: string,
     limit: number,
@@ -2956,9 +2958,10 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     const subjectAnchor = (requiredSubjectName || cleanQuery).trim();
     const subjectTokens = extractSubjectIdentityTokens(subjectAnchor);
     const subjectFullPhrase = subjectTokens.slice(0, 3).join(" ");
+    // Strictly solo clear-face by default; only relax for explicit co-star/couple/family queries
     const allowMultiSubject =
       Boolean(options?.allowContextualScenes) ||
-      /\b(and|with|cast|couple|wedding|anniversary|kids|family|movie|film|still|scene|rodeo|cowboy|award|oscar|premiere|candid|behind|interview|set|ceremony|festival|stage|concert|later|artist|painter|event)\b|&/i.test(
+      /\b(couple|wedding|anniversary|kids|family|with\s+[A-Z][a-z]+|beside\s+[A-Z][a-z]+)\b/.test(
         `${rawQuery} ${subjectAnchor}`
       );
     const stageTag = options?.stage;
@@ -3005,16 +3008,22 @@ For every scene, ensure smooth chronological transitions from one scene to the n
 
     const scoreCandidate = (title: string, url: string, w: number, h: number) => {
       let s = 2;
-      const ratio = w / Math.max(1, h);
-      // Ideal 3:4 / 4:5 vertical portrait gets top framing score, while classic 4:3 / 3:2 / 16:9 film stills & candid shots still pass cleanly!
-      if (ratio >= 0.58 && ratio <= 0.95) s += 8;
-      else if (ratio > 0.95 && ratio <= 1.38) s += 5;
-      else if (ratio > 1.38 && ratio <= 1.85) s += 3;
-      else if (ratio > 1.85) s -= 6;
+      const hasKnownDims = w > 0 && h > 0;
+      const ratio = hasKnownDims ? w / Math.max(1, h) : 0.85;
+      // Strongly prefer clear vertical/square solo portraits so faces sit centered in 3:4 frames!
+      if (hasKnownDims && ratio >= 0.56 && ratio <= 1.05) s += 12;
+      else if (hasKnownDims && ratio > 1.05 && ratio <= 1.32) s += 6;
+      else if (hasKnownDims && ratio > 1.38) s -= 16;
       if (w >= 550 && h >= 550) s += 4;
       else if (w >= 360 && h >= 360) s += 2;
-      if (/\b(solo|single|portrait|studio|editorial|still|scene|tiff|premiere|headshot|fashion|candid|young|vintage|archival|western|rodeo|oscar|award)\b/i.test(`${title} ${url}`)) {
-        s += 3;
+      if (/\b(solo|single|portrait|headshot|closeup|close[\s_-]?up|face|studio|editorial|candid|young|vintage|archival)\b/i.test(`${title} ${url}`)) {
+        s += 5;
+      }
+      if (/\b(stage|crowd|audience|group|cast|wide|backstage|duet|band|silhouette|behind)\b/i.test(`${title} ${url}`)) {
+        s -= 8;
+      }
+      if (isGenericOrNonFacePhoto(title, url)) {
+        s -= 25;
       }
       if (/\b(black\s+and\s+white|monochrome|bw)\b/i.test(`${title} ${url}`)) {
         s -= 1;
@@ -3188,11 +3197,12 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 (!mime.includes("jpeg") && !mime.includes("png")) ||
                 w < 260 ||
                 h < 260 ||
-                aspect > 1.85 ||
+                aspect > 1.42 ||
                 aspect < 0.45 ||
                 bannedTitleWords.test(combinedText) ||
                 isSpamOrNonCharacterPhoto(cleanTitle, thumbUrl, desc) ||
-                isBadCompositeOrNonSoloPhoto(combinedText, true, cleanTitle)
+                isGenericOrNonFacePhoto(cleanTitle, thumbUrl, desc) ||
+                isBadCompositeOrNonSoloPhoto(combinedText, allowMultiSubject, cleanTitle)
               ) {
                 continue;
               }
@@ -3244,27 +3254,38 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       const shouldQueryDdg = ddgCallCount < maxDdgCalls;
       if (shouldQueryDdg) ddgCallCount++;
 
-      // Run Bing Images + DuckDuckGo (rate-guarded) + Openverse + Wikipedia PageImages + Wikimedia Commons in parallel!
+      // Run Bing Face-Portrait Images + DuckDuckGo (rate-guarded) + Openverse + Wikipedia PageImages + Wikimedia Commons in parallel!
       const [bingList, ddgList, ovList, wpList, wmList] = await Promise.all([
-        // 0. Bing Images HTML/JSON card search (rich multi-era stills, candid photos, red carpet, early life)
+        // 0. Bing Face-Portrait Images (native face-portrait + photo-photo filters: clear front-facing portraits, zero wide crowds/split collages!)
         (async () => {
           const out: typeof candidates = [];
           try {
-            const results = await runBingImageSearchCached(ddgQuery);
-            for (const item of results) {
+            const [tallResults, faceResults] = await Promise.all([
+              runBingImageSearchCached(ddgQuery, { facePortrait: true, tallAspect: true }),
+              runBingImageSearchCached(ddgQuery, { facePortrait: true, tallAspect: false }),
+            ]);
+            const seenBing = new Set<string>();
+            const mergedBing = [...tallResults, ...faceResults].filter((item) => {
+              if (!item.imageUrl || seenBing.has(item.imageUrl)) return false;
+              seenBing.add(item.imageUrl);
+              return true;
+            });
+
+            for (const item of mergedBing) {
               const imgUrl = item.imageUrl;
               const thumb = item.thumbUrl;
               const title = item.title;
-              const w = item.width || 720;
-              const h = item.height || 900;
-              const ratio = w / Math.max(1, h);
+              const w = item.width || 0;
+              const h = item.height || 0;
+              const ratio = w > 0 && h > 0 ? w / Math.max(1, h) : 0;
               const combinedText = `${title} ${imgUrl} ${item.pageUrl}`;
               if (!imgUrl && !thumb) continue;
-              if (w > 0 && h > 0 && (ratio > 1.85 || ratio < 0.45 || Math.min(w, h) < 260)) continue;
+              if (w > 0 && h > 0 && (ratio > 1.42 || ratio < 0.45 || Math.min(w, h) < 260)) continue;
               if (
                 watermarkedStockDomains.test(combinedText) ||
                 bannedTitleWords.test(combinedText) ||
                 isSpamOrNonCharacterPhoto(title, imgUrl, item.pageUrl) ||
+                isGenericOrNonFacePhoto(title, imgUrl, item.pageUrl) ||
                 isBadCompositeOrNonSoloPhoto(combinedText, allowMultiSubject, title) ||
                 !doesTitleMatchSubjectIdentity(title, subjectTokens, true, /\b(soldier|army|military|navy|war|veteran)\b/i.test(rawQuery))
               ) {
@@ -3274,10 +3295,10 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 title: title.replace(/\s*\|\s*.*$/, "").slice(0, 56) || `${subjectAnchor}`,
                 thumbUrl: imgUrl || thumb,
                 fallbackThumbUrl: thumb || undefined,
-                width: w,
-                height: h,
+                width: w || 720,
+                height: h || 960,
                 year: extractPhotoYear(title),
-                score: scoreCandidate(title, imgUrl, w, h) + 4,
+                score: scoreCandidate(title, imgUrl, w, h) + 5,
                 stage: stageTag,
                 stageLabel: stageLabelTag,
               });
@@ -3304,8 +3325,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
               if (!imgUrl && !thumb) continue;
               if (w > 0 && h > 0) {
                 const ratio = w / h;
-                // Allow vertical portraits AND classic 4:3 / 3:2 / 16:9 film stills while rejecting banners/tiny thumbs
-                if (ratio > 1.85 || ratio < 0.45 || Math.min(w, h) < 280) continue;
+                // Strictly prefer vertical/square/4:3 portraits so faces never get cropped off in 3:4 frames
+                if (ratio > 1.42 || ratio < 0.45 || Math.min(w, h) < 280) continue;
               }
               if (
                 watermarkedStockDomains.test(combinedText) ||
@@ -3341,7 +3362,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             const ovRes = await fetch(
               `https://api.openverse.org/v1/images/?q=${encodeURIComponent(
                 q
-              )}&aspect_ratio=tall,square,wide&page_size=${Math.min(28, limit * 2 + 8)}`,
+              )}&aspect_ratio=tall,square&page_size=${Math.min(28, limit * 2 + 8)}`,
               {
                 headers: { "User-Agent": WIKI_USER_AGENT },
                 signal: AbortSignal.timeout(3200),
@@ -3360,7 +3381,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
               const h = Number(item?.height) || 960;
               const ratio = w / Math.max(1, h);
               const combinedText = `${title} ${tags} ${imgUrl}`;
-              if (!imgUrl || ratio > 1.85 || ratio < 0.45 || Math.min(w, h) < 300) continue;
+              if (!imgUrl || ratio > 1.42 || ratio < 0.45 || Math.min(w, h) < 300) continue;
               if (
                 watermarkedStockDomains.test(combinedText) ||
                 bannedTitleWords.test(combinedText) ||
@@ -3410,9 +3431,10 @@ For every scene, ensure smooth chronological transitions from one scene to the n
               const h = page?.thumbnail?.height || 0;
               const ratio = w / Math.max(1, h);
               const combinedText = `${pageTitle} ${pageImageName} ${thumbUrl || ""}`;
-              if (!thumbUrl || w < 260 || h < 260 || ratio > 1.85 || ratio < 0.45) continue;
+              if (!thumbUrl || w < 260 || h < 260 || ratio > 1.42 || ratio < 0.45) continue;
               if (
                 bannedTitleWords.test(combinedText) ||
+                isGenericOrNonFacePhoto(pageTitle, thumbUrl, pageImageName) ||
                 isBadCompositeOrNonSoloPhoto(combinedText, allowMultiSubject, pageTitle) ||
                 !doesTitleMatchSubjectIdentity(`${pageTitle} ${pageImageName}`, subjectTokens, true)
               ) {
@@ -3477,10 +3499,11 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 (!mime.includes("jpeg") && !mime.includes("png")) ||
                 w < 260 ||
                 h < 260 ||
-                aspect > 1.85 ||
+                aspect > 1.42 ||
                 aspect < 0.45 ||
                 bannedTitleWords.test(combinedText) ||
                 isSpamOrNonCharacterPhoto(cleanTitle, thumbUrl, desc) ||
+                isGenericOrNonFacePhoto(cleanTitle, thumbUrl, desc) ||
                 isBadCompositeOrNonSoloPhoto(combinedText, allowMultiSubject, cleanTitle) ||
                 !doesTitleMatchSubjectIdentity(`${cleanTitle} ${cats}`, subjectTokens, true, /\b(soldier|army|military|navy|war|veteran)\b/i.test(rawQuery))
               ) {
@@ -3518,23 +3541,27 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     // Sort highest-scoring clean photos first before downloading & pixel-inspecting
     candidates.sort((a, b) => b.score - a.score);
 
-    const poolToVerify = candidates.slice(0, Math.min(candidates.length, limit * 2 + 6));
+    const poolToVerify = candidates.slice(0, Math.min(candidates.length, limit * 3 + 8));
     const verified: VerifiedStagePhotoCandidate[] = [];
 
     const resolvedBatch = await Promise.all(
       poolToVerify.map(async (c) => {
-        const dataUrl = await resolveImageToDataUrlOrDirect(
+        const resolved = await resolveVerifiedPortraitImage(
           c.thumbUrl,
           c.fallbackThumbUrl,
-          true // Run FFmpeg pixel-seam & frame check to reject collages/splits!
+          {
+            rejectCollagePixels: true,
+            enforceClearFaceAspect: true,
+            allowClassicWideStill: allowMultiSubject,
+          }
         );
-        if (!dataUrl) return null;
+        if (!resolved) return null;
         return {
           title: c.title,
-          dataUrl,
+          dataUrl: resolved.dataUrl,
           sourceUrl: c.thumbUrl,
-          width: c.width,
-          height: c.height,
+          width: resolved.width || c.width,
+          height: resolved.height || c.height,
           year: c.year,
           stage: c.stage || stageTag,
           stageLabel: c.stageLabel || stageLabelTag,
@@ -4956,7 +4983,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           usedUrls,
           anchorForSearch,
           usedTitles,
-          { allowContextualScenes: true, maxDdgCalls: 2 }
+          { allowContextualScenes: false, maxDdgCalls: 2 }
         ),
         secondaryModalStage
           ? searchRealArchivalPhotos(
@@ -7899,7 +7926,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 usedUrls,
                 subjectHint,
                 usedTitleKeys,
-                { allowContextualScenes: true, stage: "peak-cinema", stageLabel: STORY_STAGE_META["peak-cinema"].labelVi }
+                { allowContextualScenes: false, stage: "peak-cinema", stageLabel: STORY_STAGE_META["peak-cinema"].labelVi }
               );
               if (hits.length > 0) {
                 actorPhotosByKw[kw] = hits;

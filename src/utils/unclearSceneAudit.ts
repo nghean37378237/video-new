@@ -8,12 +8,14 @@ import {
 import {
   classifySceneStoryStage,
   cleanCharacterNameForSearch,
+  isGenericOrNonFacePhoto,
 } from './storyStagePhotoPlanner';
 
 export type UnclearSceneReasonCode =
   | 'missing-media'
   | 'unverified-photo'
   | 'video-needs-footage'
+  | 'generic-or-unclear-face'
   | 'low-res-or-blurry'
   | 'aspect-mismatch'
   | 'duplicate-media'
@@ -171,6 +173,25 @@ export function auditScenesForUnclearMedia(
       severityScore += 65;
     }
 
+    // Check if the assigned photo is a generic wide shot, split collage, or non-clear-face photo
+    const photoMetaText = `${vaultItem?.name || ''} ${sc.realPhotoTitle || ''}`.trim();
+    const isTooWideForVerticalFace =
+      aspectRatio !== '16:9' &&
+      Boolean(width && height && width / Math.max(1, height) > 1.38);
+    if (
+      !hasRealVideoFile &&
+      Boolean(effectiveUrl) &&
+      (isGenericOrNonFacePhoto(photoMetaText, effectiveUrl) || isTooWideForVerticalFace)
+    ) {
+      reasons.push({
+        code: 'generic-or-unclear-face',
+        labelVi: 'Ảnh chung chung / cắt mặt',
+        detailVi:
+          'Ảnh gốc dạng ghép đôi, quá ngang hoặc không rõ mặt nhân vật — nên thay bằng ảnh chân dung cận mặt hoặc vẽ lại bằng Prompt.',
+      });
+      severityScore += 85;
+    }
+
     // Check sharpness / resolution & framing aspect ratio on non-video or unenhanced scenes
     let needsCrispImageUpgrade = false;
     if (!isCrispHdReady && !hasRealVideoFile) {
@@ -272,7 +293,7 @@ export function buildUnclearSceneVideoPromptPack(options: {
 
   const crispImagePrompt = /ultra-sharp|crystal-clear/i.test(baseImgPrompt)
     ? baseImgPrompt
-    : `Ultra-sharp high-definition restored documentary photograph, crisp focus on face and eyes, zero motion blur, rich fine film grain detail. ${baseImgPrompt}`;
+    : `Ultra-sharp high-definition restored solo documentary portrait of ${cleanChar}, centered clear face and eyes clearly visible, zero motion blur, no split-screen collage, no cut-off face, rich fine film grain detail. ${baseImgPrompt}`;
 
   const videoDrawPrompt = buildFullFrameVideoPrompt(
     scene.videoMotionPrompt,

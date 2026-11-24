@@ -60,42 +60,42 @@ export const STORY_STAGE_META: Record<
   'early-life': {
     labelVi: 'Tuổi Trẻ & Xuất Thân',
     shortVi: 'Tuổi trẻ',
-    defaultQueryModifiers: ['young', 'early life', 'vintage portrait', 'early career'],
+    defaultQueryModifiers: ['young portrait closeup', 'early life portrait', 'vintage portrait face', 'early career headshot'],
     allowMultiSubject: false,
     chronologicalOrder: 1,
   },
   breakthrough: {
     labelVi: 'Khởi Nghiệp & Bước Ngoặt',
     shortVi: 'Bước ngoặt',
-    defaultQueryModifiers: ['early role', 'classic photo', 'career beginning', 'vintage'],
-    allowMultiSubject: true,
+    defaultQueryModifiers: ['classic portrait closeup', 'early career portrait', 'vintage headshot', 'solo portrait'],
+    allowMultiSubject: false,
     chronologicalOrder: 2,
   },
   'peak-cinema': {
     labelVi: 'Đỉnh Cao Điện Ảnh & Vai Diễn',
     shortVi: 'Đỉnh cao phim',
-    defaultQueryModifiers: ['movie still', 'film scene', 'classic cinema', 'premiere'],
-    allowMultiSubject: true,
+    defaultQueryModifiers: ['closeup movie still portrait', 'film role portrait', 'classic cinema headshot', 'character portrait'],
+    allowMultiSubject: false,
     chronologicalOrder: 3,
   },
   'personal-behind-scenes': {
     labelVi: 'Đời Tư, Đam Mê & Hậu Trường',
     shortVi: 'Hậu trường',
-    defaultQueryModifiers: ['candid photo', 'behind the scenes', 'interview', 'off screen'],
-    allowMultiSubject: true,
+    defaultQueryModifiers: ['candid portrait closeup', 'interview portrait face', 'off screen portrait', 'smiling portrait'],
+    allowMultiSubject: false,
     chronologicalOrder: 4,
   },
   'later-years': {
     labelVi: 'Những Năm Sau Này',
     shortVi: 'Sau này',
-    defaultQueryModifiers: ['later years', 'elder', 'award ceremony', 'press photo'],
-    allowMultiSubject: true,
+    defaultQueryModifiers: ['later years portrait closeup', 'senior portrait face', 'recent portrait headshot', 'press portrait'],
+    allowMultiSubject: false,
     chronologicalOrder: 5,
   },
   'legacy-portrait': {
     labelVi: 'Chân Dung Huyền Thoại & Di Sản',
     shortVi: 'Di sản',
-    defaultQueryModifiers: ['portrait photograph', 'studio portrait', 'classic headshot'],
+    defaultQueryModifiers: ['portrait photograph', 'studio portrait closeup', 'classic headshot'],
     allowMultiSubject: false,
     chronologicalOrder: 6,
   },
@@ -139,7 +139,7 @@ const MILITARY_SERVICE_RECORD_BAN_REGEX =
   /\b(private|corporal|sergeant|lieutenant|captain|major|colonel|battalion|regiment|infantry|wwi|ww1|australian\s+war\s+memorial|service\s+number|enlisted)\b/i;
 
 const SPAM_OR_NON_CHARACTER_PHOTO_REGEX =
-  /\b(net\s*worth|height,\s*weight|weight,\s*height|religion,\s*net|wiki\s*bio|age,\s*bio|bio,\s*wiki|married,\s*wife,\s*net|movie\s+mistakes|mistakes\s+that\s+made|greatest\s+[a-z\s]{0,24}actors|top\s+\d+|best\s+\d+|\d+\s+greatest|\d+\s+best|\d+\s+famous|\d+\s+most\s+|ranked\b|list\s+of\s+|things\s+you\s+didn'?t\s+know|fineartamerica|pixels\.com|saatchiart|artfinder|liveauctioneers|invaluable\.com|artnet\.com|mutualart|art\s+for\s+sale|oil\s+on\s+(board|canvas|panel)|o\/b\b|canvas\s+print|framed\s+print|art\s+print|poster\s+print|scene\s+painting|painting\s+by|watercolor\s+painting|acrylic\s+painting|auction\s+lot)\b/i;
+  /\b(net\s*worth|height,\s*weight|weight,\s*height|religion,\s*net|wiki\s*bio|age,\s*bio|bio,\s*wiki|married,\s*wife,\s*net|movie\s+mistakes|mistakes\s+that\s+made|greatest\s+[a-z\s]{0,24}actors|top\s+\d+|best\s+\d+|\d+\s+greatest|\d+\s+best|\d+\s+famous|\d+\s+most\s+|ranked\b|list\s+of\s+|things\s+you\s+didn'?t\s+know|fineartamerica|pixels\.com|saatchiart|artfinder|liveauctioneers|invaluable\.com|artnet\.com|mutualart|art\s+for\s+sale|oil\s+on\s+(board|canvas|panel)|o\/b\b|canvas\s+print|framed\s+print|art\s+print|poster\s+print|wall\s+art|scene\s+painting|painting\s+by|watercolor\s+painting|acrylic\s+painting|auction\s+lot)\b|\bprints?\s*$/i;
 
 export function matchesCharacterPhotoIdentity(
   rawText: string,
@@ -205,13 +205,28 @@ export function matchesCharacterPhotoIdentity(
   return true;
 }
 
+const GENERIC_OR_NON_FACE_PHOTO_REGEX =
+  /\b(before[\s_-]?and[\s_-]?after|then[\s_-]?and[\s_-]?now|then[\s_-]?vs[\s_-]?now|side[\s_-]?by[\s_-]?side|split[\s_-]?screen|splitscreen|collage|montage|diptych|triptych|comparison|compared|transformation|plastic[\s_-]?surgery|unrecognizable|how\s+[a-z\s]{1,24}changed|through[\s_-]?the[\s_-]?years|over[\s_-]?the[\s_-]?years|years[\s_-]?later|lookalike|impersonator|wax[\s_-]?figure|tribute[\s_-]?band|cosplay|back[\s_-]?view|from[\s_-]?behind|rear[\s_-]?view|back[\s_-]?of[\s_-]?head|silhouette|shadow[\s_-]?only|wide[\s_-]?shot|long[\s_-]?shot|full[\s_-]?stage|stage[\s_-]?wide|concert[\s_-]?crowd|packed[\s_-]?arena|audience[\s_-]?view|crowd[\s_-]?shot|guitar[\s_-]?closeup|microphone[\s_-]?stand|hands[\s_-]?only|outfit[\s_-]?detail|dress[\s_-]?detail|red[\s_-]?carpet[\s_-]?group|group[\s_-]?photo|ensemble[\s_-]?cast|full[\s_-]?cast|band[\s_-]?members|with[\s_-]?fans|fan[\s_-]?selfie)\b/i;
+
+export function isGenericOrNonFacePhoto(
+  title: string,
+  imageUrl = '',
+  pageUrl = ''
+): boolean {
+  const combined = `${title || ''} ${imageUrl || ''} ${pageUrl || ''}`;
+  return GENERIC_OR_NON_FACE_PHOTO_REGEX.test(combined);
+}
+
 export function isSpamOrNonCharacterPhoto(
   title: string,
   imageUrl = '',
   pageUrl = ''
 ): boolean {
   const combined = `${title || ''} ${imageUrl || ''} ${pageUrl || ''}`;
-  return SPAM_OR_NON_CHARACTER_PHOTO_REGEX.test(combined);
+  return (
+    SPAM_OR_NON_CHARACTER_PHOTO_REGEX.test(combined) ||
+    GENERIC_OR_NON_FACE_PHOTO_REGEX.test(combined)
+  );
 }
 
 export function extractHistoricalPhotoYear(
@@ -295,18 +310,18 @@ function extractNotableSceneKeywords(
     }
   }
 
-  // 3. Domain-specific visual motifs from English narration
+  // 3. Domain-specific visual motifs from English narration (always anchored to clear character face/portrait!)
   const motifPatterns: Array<{ regex: RegExp; hint: string }> = [
-    { regex: /\b(rodeo|cowboy|bronco|ranch|horseback|western)\b/i, hint: 'rodeo cowboy western' },
-    { regex: /\b(paint|painter|paintbrush|canvas|artist|art)\b/i, hint: 'artist painter' },
-    { regex: /\b(oscar|academy\s+award|golden\s+globe|award|ceremony)\b/i, hint: 'academy awards ceremony' },
-    { regex: /\b(soldier|army|navy|war|military|marine|veteran)\b/i, hint: 'military uniform vintage' },
-    { regex: /\b(martial\s+arts|kung\s+fu|karate|boxing|ring|fight)\b/i, hint: 'martial arts action' },
-    { regex: /\b(guitar|singer|concert|stage|music|band|microphone)\b/i, hint: 'concert stage performance' },
-    { regex: /\b(director|directing|camera|behind\s+the\s+scenes|on\s+set|filming)\b/i, hint: 'on set behind the scenes' },
-    { regex: /\b(family|wife|husband|wedding|married|son|daughter|children)\b/i, hint: 'family candid' },
-    { regex: /\b(activist|founder|registry|community|speech|speaking|advocate)\b/i, hint: 'speaking event' },
-    { regex: /\b(childhood|born|baby|boy|girl|school|teen|grew\s+up|youth)\b/i, hint: 'young vintage' },
+    { regex: /\b(rodeo|cowboy|bronco|ranch|horseback|western)\b/i, hint: 'cowboy portrait western' },
+    { regex: /\b(paint|painter|paintbrush|canvas|artist|art)\b/i, hint: 'artist portrait' },
+    { regex: /\b(oscar|academy\s+award|golden\s+globe|award|ceremony)\b/i, hint: 'award portrait closeup' },
+    { regex: /\b(soldier|army|navy|war|military|marine|veteran)\b/i, hint: 'military uniform portrait' },
+    { regex: /\b(martial\s+arts|kung\s+fu|karate|boxing|ring|fight)\b/i, hint: 'martial arts portrait closeup' },
+    { regex: /\b(guitar|singer|concert|stage|music|band|microphone)\b/i, hint: 'singer portrait closeup' },
+    { regex: /\b(director|directing|camera|behind\s+the\s+scenes|on\s+set|filming)\b/i, hint: 'on set portrait' },
+    { regex: /\b(family|wife|husband|wedding|married|son|daughter|children)\b/i, hint: 'candid portrait' },
+    { regex: /\b(activist|founder|registry|community|speech|speaking|advocate)\b/i, hint: 'interview portrait' },
+    { regex: /\b(childhood|born|baby|boy|girl|school|teen|grew\s+up|youth)\b/i, hint: 'young portrait vintage' },
   ];
 
   const narrationLower = `${scene.title || ''} ${scene.narrationText || ''}`;
@@ -379,10 +394,10 @@ export function classifySceneStoryStage(
   }
 
   const meta = STORY_STAGE_META[stage];
+  // Strictly solo clear-face by default; only allow 2-person contextual scenes when the script explicitly mentions a co-star/spouse/family
   const allowContextualMultiPerson =
-    meta.allowMultiSubject ||
-    /\b(beside|with|co-star|cast|scene|movie|film|award|oscar|family|rodeo|cowboy|couple|ceremony|reunion|interview)\b/i.test(
-      combined
+    /\b(beside\s+[A-Z][a-z]+|with\s+[A-Z][a-z]+|co-star|couple|wedding|married|husband|wife|family)\b/.test(
+      `${scene.title || ''} ${scene.narrationText || ''}`
     );
 
   const cleanChar = cleanCharacterNameForSearch(characterName);
@@ -391,15 +406,17 @@ export function classifySceneStoryStage(
   if (cleanChar) {
     if (extractedHints.length > 0) {
       const leadHint = extractedHints[0];
-      const withYear = targetYear && !leadHint.includes(String(targetYear))
-        ? `${cleanChar} ${leadHint} ${targetYear}`
-        : `${cleanChar} ${leadHint}`;
+      const hasPortraitTerm = /\b(portrait|headshot|closeup|face)\b/i.test(leadHint);
+      const enrichedHint = hasPortraitTerm ? leadHint : `${leadHint} portrait`;
+      const withYear = targetYear && !enrichedHint.includes(String(targetYear))
+        ? `${cleanChar} ${enrichedHint} ${targetYear}`
+        : `${cleanChar} ${enrichedHint}`;
       querySuggestions.push(withYear.replace(/\s+/g, ' ').trim());
     }
     if (targetYear) {
-      querySuggestions.push(`${cleanChar} ${targetYear} photo`);
+      querySuggestions.push(`${cleanChar} ${targetYear} portrait`);
     }
-    querySuggestions.push(`${cleanChar} ${meta.defaultQueryModifiers[0]} photo`);
+    querySuggestions.push(`${cleanChar} ${meta.defaultQueryModifiers[0]}`);
   }
 
   return {
@@ -490,10 +507,10 @@ export function buildRichStagePhotoQueries(
     }
   }
 
-  // 3. Ensure every core documentary life stage is represented so photo variety is always rich!
+  // 3. Ensure every core documentary life stage is represented with CLEAR SOLO FACE portraits!
   const coreStageFallbacks: StageSearchQueryPlan[] = [
     {
-      query: `${cleanChar} young early life photo`,
+      query: `${cleanChar} young portrait closeup`,
       stage: 'early-life',
       stageLabelVi: STORY_STAGE_META['early-life'].labelVi,
       allowMultiSubject: false,
@@ -501,39 +518,39 @@ export function buildRichStagePhotoQueries(
       priority: 8,
     },
     {
-      query: `${cleanChar} movie still film scene`,
+      query: `${cleanChar} closeup film still portrait`,
       stage: 'peak-cinema',
       stageLabelVi: STORY_STAGE_META['peak-cinema'].labelVi,
-      allowMultiSubject: true,
+      allowMultiSubject: false,
       targetYear: null,
       priority: 8,
     },
     {
-      query: `${cleanChar} candid behind the scenes photo`,
+      query: `${cleanChar} candid portrait smiling closeup`,
       stage: 'personal-behind-scenes',
       stageLabelVi: STORY_STAGE_META['personal-behind-scenes'].labelVi,
-      allowMultiSubject: true,
+      allowMultiSubject: false,
       targetYear: null,
       priority: 7,
     },
     {
-      query: `${cleanChar} premiere awards red carpet`,
+      query: `${cleanChar} classic headshot portrait`,
       stage: 'breakthrough',
       stageLabelVi: STORY_STAGE_META.breakthrough.labelVi,
-      allowMultiSubject: true,
+      allowMultiSubject: false,
       targetYear: null,
       priority: 7,
     },
     {
-      query: `${cleanChar} later years interview photo`,
+      query: `${cleanChar} later years portrait face`,
       stage: 'later-years',
       stageLabelVi: STORY_STAGE_META['later-years'].labelVi,
-      allowMultiSubject: true,
+      allowMultiSubject: false,
       targetYear: null,
       priority: 6,
     },
     {
-      query: `${cleanChar} classic vintage archival photograph`,
+      query: `${cleanChar} studio portrait photograph`,
       stage: 'legacy-portrait',
       stageLabelVi: STORY_STAGE_META['legacy-portrait'].labelVi,
       allowMultiSubject: false,
@@ -720,9 +737,22 @@ export function rankAndAssignStagePhotosToScenes(
     }
     score += Math.min(30, overlapHits * 8);
 
-    // Slight preference for vertical/3:4 framing when scores tie
+    // Strong priority for clear vertical/square solo portrait framing (avoid wide shots that slice faces when center-cropped to 3:4!)
     const aspect = (photo.width || 720) / Math.max(1, photo.height || 960);
-    if (aspect >= 0.6 && aspect <= 1.05) score += 2;
+    if (aspect >= 0.56 && aspect <= 1.08) score += 16;
+    else if (aspect > 1.08 && aspect <= 1.32) score += 6;
+    else if (aspect > 1.38) score -= 28;
+
+    const metaText = `${photo.title || ''} ${photo.sourceUrl || ''}`;
+    if (/\b(portrait|headshot|closeup|close[\s_-]?up|face|solo|studio|chân\s*dung)\b/i.test(metaText)) {
+      score += 10;
+    }
+    if (/\b(stage|crowd|audience|group|cast|wide|backstage|duet|band|silhouette|behind|rear)\b/i.test(metaText)) {
+      score -= 16;
+    }
+    if (isGenericOrNonFacePhoto(photo.title, photo.sourceUrl)) {
+      score -= 40;
+    }
 
     return score;
   };

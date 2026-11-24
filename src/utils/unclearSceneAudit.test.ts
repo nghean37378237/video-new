@@ -136,9 +136,10 @@ test('auditScenesForUnclearMedia flags missing media, video scenes without real 
   assert.equal(audits['s2'].isUnclear, true);
   assert.ok(audits['s2'].reasons.some((r) => r.code === 'duplicate-media'));
 
-  // s3: wide 16:9 photo in 3:4 project -> aspect-mismatch + low height
+  // s3: wide 16:9 photo in 3:4 project -> aspect-mismatch + generic-or-unclear-face
   assert.equal(audits['s3'].isUnclear, true);
   assert.ok(audits['s3'].reasons.some((r) => r.code === 'aspect-mismatch'));
+  assert.ok(audits['s3'].reasons.some((r) => r.code === 'generic-or-unclear-face'));
 
   // s4: real video MP4 -> clear!
   assert.equal(audits['s4'].isUnclear, false);
