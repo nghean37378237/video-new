@@ -1296,7 +1296,7 @@ After the vows, the couple skipped a lavish reception and spent the afternoon ea
                 ) : (
                   <Globe className="w-3 h-3 text-emerald-400" />
                 )}
-                Tự Tìm Ảnh Thật Vào Kho
+                Tìm Ảnh Theo Giai Đoạn
               </button>
             </div>
 

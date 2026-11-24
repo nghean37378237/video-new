@@ -42,6 +42,10 @@ import {
   VideoScriptStyle,
 } from '../utils/fullFrameHelper';
 import {
+  classifySceneStoryStage,
+  cleanCharacterNameForSearch,
+} from '../utils/storyStagePhotoPlanner';
+import {
   analyzeVoiceCloneDNAFromAudioFile,
   BG_MUSIC_STYLE_LABELS,
   loadActiveVoiceCloneDNA,
@@ -199,32 +203,98 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
     setTimeout(() => setCopiedField(null), 1800);
   };
 
+  const [stagePhotoOptionsByScene, setStagePhotoOptionsByScene] = useState<
+    Record<
+      string,
+      Array<{
+        title: string;
+        dataUrl: string;
+        year?: number | null;
+        stageLabel?: string;
+      }>
+    >
+  >({});
+  const [seenScenePhotoUrls, setSeenScenePhotoUrls] = useState<Record<string, string[]>>({});
+
+  const activeSceneStageInfo = activeScene
+    ? classifySceneStoryStage(
+        activeScene,
+        Math.max(0, scenes.findIndex((s) => s.id === activeScene.id)),
+        scenes.length,
+        cleanCharacterNameForSearch(savedAudioPrefs.storyTopic || settings.projectTitle)
+      )
+    : null;
+
   const handleFetchRealPhotoForScene = async () => {
     if (!activeScene || isFetchingRealPhoto) return;
     setIsFetchingRealPhoto(true);
     try {
+      const cleanCharName =
+        cleanCharacterNameForSearch(savedAudioPrefs.storyTopic || settings.projectTitle) ||
+        settings.projectTitle;
+      const prevSeen = seenScenePhotoUrls[activeScene.id] || [];
+      const excludeList = activeScene.mediaUrl
+        ? Array.from(new Set([...prevSeen, activeScene.mediaUrl]))
+        : prevSeen;
+
       const res = await fetch('/api/archival/match-scenes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          topic: settings.projectTitle,
+          topic: cleanCharName,
+          storyMode: settings.storyMode || 'biography',
+          skipVideoCuts: true,
+          excludeUrls: excludeList,
           scenes: [
             {
               id: activeScene.id,
+              order: activeScene.order,
               title: activeScene.title,
               sceneType: activeScene.sceneType,
+              narrationText: activeScene.narrationText,
               archivalKeywords: activeScene.archivalKeywords || activeScene.title,
+              visualPrompt: activeScene.visualPrompt,
             },
           ],
         }),
       });
       if (res.ok) {
         const data = await res.json();
-        const matched = data?.matchedBySceneId?.[activeScene.id];
+        const candidates: Array<{
+          title: string;
+          dataUrl: string;
+          year?: number | null;
+          stageLabel?: string;
+        }> = Array.isArray(data?.stageCandidatesBySceneId?.[activeScene.id])
+          ? data.stageCandidatesBySceneId[activeScene.id]
+          : Array.isArray(data?.allPhotos)
+          ? data.allPhotos.filter((p: any) => p.mediaKind !== 'video' && p.dataUrl)
+          : [];
+
+        if (candidates.length > 0) {
+          setStagePhotoOptionsByScene((prev) => ({
+            ...prev,
+            [activeScene.id]: candidates.slice(0, 12),
+          }));
+        }
+
+        const matched =
+          data?.matchedBySceneId?.[activeScene.id] ||
+          data?.referenceBySceneId?.[activeScene.id] ||
+          candidates[0];
         if (matched?.dataUrl) {
+          setSeenScenePhotoUrls((prev) => ({
+            ...prev,
+            [activeScene.id]: Array.from(new Set([...excludeList, matched.dataUrl])).slice(-12),
+          }));
           onUpdateScene(activeScene.id, {
             mediaUrl: matched.dataUrl,
             mediaKind: 'image',
+            hasRealPhoto: true,
+            characterRefPhotoUrl: matched.dataUrl,
+            realPhotoTitle: matched.stageLabel
+              ? `[${matched.stageLabel}] ${matched.title}`
+              : matched.title,
             frameStyle: 'full-bleed',
             showBottomSubtitles: true,
           });
@@ -638,6 +708,73 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
                   </button>
                 )}
               </div>
+
+              {activeSceneStageInfo && (
+                <div className="flex items-center justify-between gap-2 px-2 py-1 rounded-md bg-slate-900/70 border border-slate-800 text-[10px] text-slate-300">
+                  <span className="truncate">
+                    🎯 Giai đoạn cốt truyện:{' '}
+                    <strong className="text-amber-300">
+                      {activeSceneStageInfo.stageLabelVi}
+                    </strong>
+                    {activeSceneStageInfo.targetYear
+                      ? ` (${activeSceneStageInfo.targetYear})`
+                      : ''}
+                  </span>
+                </div>
+              )}
+
+              {(stagePhotoOptionsByScene[activeScene.id]?.length ?? 0) > 1 && (
+                <div className="space-y-1.5 rounded-md bg-slate-900/80 border border-slate-800 p-2">
+                  <div className="flex items-center justify-between text-[10px] text-slate-400">
+                    <span className="font-semibold text-amber-300">
+                      Ảnh nhân vật tìm được ({stagePhotoOptionsByScene[activeScene.id].length} ảnh) — bấm để đổi:
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1.5 max-h-40 overflow-y-auto pr-0.5">
+                    {stagePhotoOptionsByScene[activeScene.id].map((opt, idx) => {
+                      const isSelected = activeScene.mediaUrl === opt.dataUrl;
+                      return (
+                        <button
+                          key={`${activeScene.id}-stage-opt-${idx}`}
+                          type="button"
+                          onClick={() =>
+                            onUpdateScene(activeScene.id, {
+                              mediaUrl: opt.dataUrl,
+                              mediaKind: 'image',
+                              hasRealPhoto: true,
+                              characterRefPhotoUrl: opt.dataUrl,
+                              realPhotoTitle: opt.stageLabel
+                                ? `[${opt.stageLabel}] ${opt.title}`
+                                : opt.title,
+                              frameStyle: 'full-bleed',
+                              showBottomSubtitles: true,
+                            })
+                          }
+                          title={`${opt.stageLabel ? `[${opt.stageLabel}] ` : ''}${opt.title}`}
+                          aria-label={`Chọn ảnh ${opt.title}`}
+                          className={`group relative aspect-[3/4] rounded overflow-hidden border transition-all ${
+                            isSelected
+                              ? 'border-amber-400 ring-1 ring-amber-400'
+                              : 'border-slate-700 hover:border-amber-400/70'
+                          }`}
+                        >
+                          <img
+                            src={opt.dataUrl}
+                            alt={opt.title}
+                            className="w-full h-full object-cover"
+                            loading="lazy"
+                          />
+                          {opt.stageLabel && (
+                            <span className="absolute bottom-0 inset-x-0 bg-black/75 text-[8px] leading-tight text-amber-200 px-1 py-0.5 truncate">
+                              {opt.year || opt.stageLabel}
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {(activeScene.mediaUrl || activeScene.characterRefPhotoUrl) && (
                 <button

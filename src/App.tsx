@@ -227,13 +227,26 @@ export default function App() {
     [isExtractingFrames, settings.referenceVideoUrl]
   );
 
-  // Automatically fetch real historical photos AND videos of any character from Wikimedia Commons
+  // Automatically fetch rich multi-stage character photos AND videos across all storyline stages
   const fetchArchivalPhotosInternal = async (characterQuery: string): Promise<VaultItem[]> => {
     try {
       const res = await fetch('/api/archival/fetch-photos', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: characterQuery, limit: 12 }),
+        body: JSON.stringify({
+          query: characterQuery,
+          limit: 24,
+          storyMode: settings.storyMode || 'biography',
+          scenes: scenes.map((s) => ({
+            id: s.id,
+            order: s.order,
+            title: s.title,
+            sceneType: s.sceneType,
+            narrationText: s.narrationText,
+            archivalKeywords: s.archivalKeywords,
+            visualPrompt: s.visualPrompt,
+          })),
+        }),
       });
       if (!res.ok) return [];
       const data = await safeParseJsonResponse(res);
@@ -241,11 +254,16 @@ export default function App() {
 
       const fetchedItems: VaultItem[] = data.photos.map((p: any, idx: number) => {
         const isVideo = p.mediaKind === 'video' && Boolean(p.videoUrl);
+        const stageText = p.stageLabel
+          ? `Giai đoạn: ${p.stageLabel}${p.year ? ` (${p.year})` : ''}`
+          : p.year
+          ? `Ảnh lịch sử (${p.year})`
+          : 'Ảnh lịch sử tự động';
         return {
           id: `archival-${Date.now()}-${idx}`,
           name: isVideo
             ? `🎬 Video Thật: ${p.title || `${characterQuery} #${idx + 1}`}`
-            : `📸 Ảnh Thật: ${p.title || `${characterQuery} #${idx + 1}`}`,
+            : `📸 ${p.stageLabel ? `[${p.stageLabel}] ` : ''}${p.title || `${characterQuery} #${idx + 1}`}`,
           type: isVideo ? 'video' : 'image',
           url: isVideo ? p.videoUrl : p.dataUrl,
           thumbnailUrl: p.dataUrl,
@@ -253,11 +271,20 @@ export default function App() {
           height: p.height,
           durationSec: 7,
           sourceTag: 'uploaded',
-          createdAt: isVideo ? 'Video tư liệu thật' : 'Ảnh lịch sử tự động',
+          createdAt: isVideo ? 'Video tư liệu thật' : stageText,
         };
       });
 
-      setVaultItems((prev) => [...fetchedItems, ...prev]);
+      setVaultItems((prev) => {
+        const existingKeys = new Set(prev.map((item) => (item.url || '').slice(0, 120)));
+        const fresh = fetchedItems.filter((item) => {
+          const k = (item.url || '').slice(0, 120);
+          if (!k || existingKeys.has(k)) return false;
+          existingKeys.add(k);
+          return true;
+        });
+        return [...fresh, ...prev];
+      });
       return fetchedItems;
     } catch {
       return [];
@@ -279,10 +306,11 @@ export default function App() {
         setScenes(updatedScenes);
       }
       const items = await fetchArchivalPhotosInternal(characterQuery);
+      const imageItemsCount = items.filter((it) => it.type === 'image').length;
       const totalFound = matchedCount + items.length;
       if (totalFound > 0) {
         setStatusBanner(
-          `Đã tự động tìm được ${matchedVideosCount} Video Thật & ${matchedPhotosCount} Ảnh Thật gắn thẳng vào cảnh + cấp sẵn Ảnh Mẫu & Prompt Kling AI cho ${missingCount} cảnh còn lại để bạn vẽ và reg video!`
+          `Đã tìm được ${Math.max(matchedPhotosCount, imageItemsCount)} Ảnh Nhân Vật phong phú theo từng giai đoạn cốt truyện & ${matchedVideosCount} Video Thật — gắn trực tiếp vào các phân cảnh và bổ sung vào Kho Tư Liệu!`
         );
       } else {
         setStatusBanner(
@@ -1896,9 +1924,12 @@ export default function App() {
               storyMode: activeMode,
               scenes: scenesNeedingSearch.map((s) => ({
                 id: s.id,
+                order: s.order,
                 title: s.title,
                 sceneType: s.sceneType,
+                narrationText: s.narrationText,
                 archivalKeywords: s.archivalKeywords,
+                visualPrompt: s.visualPrompt,
               })),
             }),
           });
@@ -1926,12 +1957,33 @@ export default function App() {
           mediaKind?: 'video' | 'image';
           width: number;
           height: number;
+          year?: number | null;
+          stageLabel?: string;
         }
       > = data?.matchedBySceneId || {};
 
+      const referenceBySceneId: Record<
+        string,
+        {
+          title: string;
+          dataUrl: string;
+          width: number;
+          height: number;
+          year?: number | null;
+          stageLabel?: string;
+        }
+      > = data?.referenceBySceneId || {};
+
       // Primary verified real portrait of the character so scenes missing unique media still give the user a downloadable reference face photo
-      const allPoolItems: Array<{ title?: string; dataUrl?: string; mediaKind?: string }> =
-        Array.isArray(data?.allPhotos) ? data.allPhotos : [];
+      const allPoolItems: Array<{
+        title?: string;
+        dataUrl?: string;
+        mediaKind?: string;
+        width?: number;
+        height?: number;
+        year?: number | null;
+        stageLabel?: string;
+      }> = Array.isArray(data?.allPhotos) ? data.allPhotos : [];
       const photoPoolOnly = allPoolItems.filter(
         (item) => item.mediaKind !== 'video' && item.dataUrl
       );
@@ -1941,7 +1993,7 @@ export default function App() {
         allPoolItems[0]?.dataUrl ||
         undefined;
 
-      // Track which photos were already assigned to 'image' scenes so remaining 'video' scenes get distinct reference photos for Grok/Kling drawing
+      // Track which photos were already assigned to 'image' scenes so remaining 'video' scenes get distinct stage-matched reference photos
       const assignedImageUrls = new Set<string>(
         Object.values(matchedMap)
           .filter((m) => m.mediaKind !== 'video' && m.dataUrl)
@@ -1991,18 +2043,21 @@ export default function App() {
 
         const matched = matchedMap[sc.id];
         if (!matched || (!matched.dataUrl && !matched.videoUrl)) {
-          // For any 'video' scene without a real cut video, provide a clean real Reference Photo of the actor + ready-to-copy Grok / Kling AI Prompt so the user can either pick & cut a video or draw it later!
+          // Prefer the server's stage-matched unique reference photo for this exact scene before falling back to pool rotation
           missingCount++;
+          const stageMatchedRef = referenceBySceneId[sc.id];
           const pickedRef =
+            stageMatchedRef ||
             spareRefPhotos[spareRefCursor % Math.max(1, spareRefPhotos.length)] ||
             photoPoolOnly[spareRefCursor % Math.max(1, photoPoolOnly.length)];
-          if (pickedRef) spareRefCursor++;
+          if (!stageMatchedRef && pickedRef) spareRefCursor++;
           const refDataUrl = pickedRef?.dataUrl || primaryCharacterPhotoUrl || sc.characterRefPhotoUrl;
+          const stagePrefix = pickedRef?.stageLabel ? `[${pickedRef.stageLabel}] ` : '';
           return {
             ...sc,
             hasRealPhoto: Boolean(refDataUrl),
             realPhotoTitle: pickedRef?.title
-              ? `${pickedRef.title} (Ảnh Gốc Tạo Video Grok / Kling)`
+              ? `${stagePrefix}${pickedRef.title} (Ảnh Gốc Tạo Video Grok / Kling)`
               : `${topicHint} (Ảnh Gốc Tạo Video Grok / Kling)`,
             characterRefPhotoUrl: refDataUrl,
             imagePrompt: klingPack.klingImagePrompt,
@@ -2048,7 +2103,7 @@ export default function App() {
           id: `real-media-${Date.now()}-${idx}`,
           name: isRealVideo
             ? `🎬 Video Thật Cảnh #${String(sc.order).padStart(2, '0')} (✂️ ${origStart}s→${origEnd}s): ${matched.title}`
-            : `📸 Ảnh Thật Cảnh #${String(sc.order).padStart(2, '0')}: ${matched.title}`,
+            : `📸 Ảnh Thật Cảnh #${String(sc.order).padStart(2, '0')}${matched.stageLabel ? ` · ${matched.stageLabel}` : ''}: ${matched.title}`,
           type: isRealVideo ? 'video' : 'image',
           url: isRealVideo ? matched.videoUrl! : matched.dataUrl,
           thumbnailUrl: matched.dataUrl,
@@ -2058,6 +2113,8 @@ export default function App() {
           sourceTag: 'uploaded',
           createdAt: isRealVideo
             ? `✂️ Video thật đã cắt ${origStart}s→${origEnd}s`
+            : matched.stageLabel
+            ? `Giai đoạn: ${matched.stageLabel}${matched.year ? ` (${matched.year})` : ''}`
             : 'Ảnh thật chuẩn nhân vật',
         };
         newVaultItems.push(vaultItem);
@@ -2072,6 +2129,8 @@ export default function App() {
           hasRealPhoto: true,
           realPhotoTitle: isRealVideo
             ? `✂️ Cắt riêng (${origStart}s→${origEnd}s) · ${matched.title}`
+            : matched.stageLabel
+            ? `[${matched.stageLabel}] ${matched.title}`
             : matched.title,
           characterRefPhotoUrl: matched.dataUrl || primaryCharacterPhotoUrl,
           imagePrompt: klingPack.klingImagePrompt,
@@ -2082,8 +2141,39 @@ export default function App() {
         };
       });
 
+      // Also add all extra unique stage-matched photos into the Media Vault so the user can freely pick across every life stage!
+      const alreadyQueuedUrls = new Set(newVaultItems.map((v) => (v.url || '').slice(0, 120)));
+      photoPoolOnly.forEach((extraPhoto, eIdx) => {
+        const urlKey = (extraPhoto.dataUrl || '').slice(0, 120);
+        if (!urlKey || alreadyQueuedUrls.has(urlKey)) return;
+        alreadyQueuedUrls.add(urlKey);
+        newVaultItems.push({
+          id: `stage-photo-${Date.now()}-${eIdx}`,
+          name: `📸 ${extraPhoto.stageLabel ? `[${extraPhoto.stageLabel}] ` : ''}${extraPhoto.title || `${topicHint} #${eIdx + 1}`}`,
+          type: 'image',
+          url: extraPhoto.dataUrl!,
+          thumbnailUrl: extraPhoto.dataUrl!,
+          width: extraPhoto.width || 720,
+          height: extraPhoto.height || 960,
+          durationSec: 8,
+          sourceTag: 'uploaded',
+          createdAt: extraPhoto.stageLabel
+            ? `Giai đoạn: ${extraPhoto.stageLabel}${extraPhoto.year ? ` (${extraPhoto.year})` : ''}`
+            : 'Ảnh nhân vật theo cốt truyện',
+        });
+      });
+
       if (newVaultItems.length > 0) {
-        setVaultItems((prev) => [...newVaultItems, ...prev]);
+        setVaultItems((prev) => {
+          const existingKeys = new Set(prev.map((item) => (item.url || '').slice(0, 120)));
+          const fresh = newVaultItems.filter((item) => {
+            const k = (item.url || '').slice(0, 120);
+            if (!k || existingKeys.has(k)) return false;
+            existingKeys.add(k);
+            return true;
+          });
+          return [...fresh, ...prev];
+        });
       }
 
       return {
