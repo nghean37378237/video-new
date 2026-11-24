@@ -76,6 +76,12 @@ import {
   classifyClearFacePhotoCategory,
   getClearFaceCategoryLabel,
 } from './utils/clearFaceScenePlanner';
+import {
+  clearOldCharacterLocalStorage,
+  isDifferentCharacterSession,
+  sanitizeVaultItemsForNewCharacter,
+  stripOldCharacterMediaFromScenes,
+} from './utils/characterSessionReset';
 
 export default function App() {
   const [vaultItems, setVaultItems] = useState<VaultItem[]>(() => {
@@ -152,9 +158,46 @@ export default function App() {
   const [generatingImageSceneId, setGeneratingImageSceneId] = useState<string | null>(null);
   const [searchingMediaSceneId, setSearchingMediaSceneId] = useState<string | null>(null);
   const sceneCycleMapRef = React.useRef<Record<string, number>>({});
+  const characterEpochRef = React.useRef<number>(0);
+  const lastActiveCharacterRef = React.useRef<string>(
+    cleanCharacterNameForSearch(
+      INITIAL_PROJECT_SETTINGS.projectTitle
+    ) || 'Will Sampson'
+  );
   const [isLightTheme, setIsLightTheme] = useState<boolean>(true);
 
   const activeScene = scenes.find((s) => s.id === activeSceneId) || scenes[0];
+
+  /**
+   * Immediately clears all old-character media (Vault items, localStorage cut caches,
+   * cycle counters, and stale storyTopic) whenever the user starts searching or
+   * generating a new character so previous characters never linger.
+   */
+  const resetWorkspaceForNewCharacter = useCallback(
+    (nextCharacterRaw: string, options?: { preserveVaultIds?: Set<string>; forceClear?: boolean }) => {
+      const cleanNext = cleanCharacterNameForSearch(nextCharacterRaw) || nextCharacterRaw.trim();
+      if (!cleanNext) return false;
+      const switched =
+        options?.forceClear || isDifferentCharacterSession(lastActiveCharacterRef.current, cleanNext);
+      if (!switched) return false;
+
+      characterEpochRef.current += 1;
+      lastActiveCharacterRef.current = cleanNext;
+      sceneCycleMapRef.current = {};
+      videoCutCycleRef.current = 0;
+
+      clearOldCharacterLocalStorage();
+      setVaultItems((prev) =>
+        sanitizeVaultItemsForNewCharacter(prev, cleanNext, {
+          keepOnlyMatchingCharacter: false,
+          preserveIds: options?.preserveVaultIds,
+        })
+      );
+      saveAudioPreferences({ storyTopic: cleanNext });
+      return true;
+    },
+    []
+  );
 
   const handleUpdateSettings = useCallback((patch: Partial<ProjectSettings>) => {
     setSettings((prev) => ({ ...prev, ...patch }));
@@ -244,8 +287,13 @@ export default function App() {
   );
 
   // Automatically fetch rich multi-stage character photos AND videos across all storyline stages
-  const fetchArchivalPhotosInternal = async (characterQuery: string): Promise<VaultItem[]> => {
+  const fetchArchivalPhotosInternal = async (
+    characterQuery: string,
+    replaceVault = false,
+    targetScenesOverride?: StoryScene[]
+  ): Promise<VaultItem[]> => {
     try {
+      const scenesForContext = targetScenesOverride || scenes;
       const res = await fetch('/api/archival/fetch-photos', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -253,7 +301,7 @@ export default function App() {
           query: characterQuery,
           limit: 24,
           storyMode: settings.storyMode || 'biography',
-          scenes: scenes.map((s) => ({
+          scenes: scenesForContext.map((s) => ({
             id: s.id,
             order: s.order,
             title: s.title,
@@ -292,14 +340,19 @@ export default function App() {
       });
 
       setVaultItems((prev) => {
-        const existingKeys = new Set(prev.map((item) => (item.url || '').slice(0, 120)));
+        const base = replaceVault
+          ? sanitizeVaultItemsForNewCharacter(prev, characterQuery, {
+              keepOnlyMatchingCharacter: true,
+            })
+          : prev;
+        const existingKeys = new Set(base.map((item) => (item.url || '').slice(0, 120)));
         const fresh = fetchedItems.filter((item) => {
           const k = (item.url || '').slice(0, 120);
           if (!k || existingKeys.has(k)) return false;
           existingKeys.add(k);
           return true;
         });
-        return [...fresh, ...prev];
+        return [...fresh, ...base];
       });
       return fetchedItems;
     } catch {
@@ -308,8 +361,24 @@ export default function App() {
   };
 
   const handleFetchArchivalPhotos = async (characterQuery: string) => {
-    if (!characterQuery.trim() || isFetchingArchival) return;
+    const cleanQuery = characterQuery.trim();
+    if (!cleanQuery || isFetchingArchival) return;
     setIsFetchingArchival(true);
+
+    // Always wipe previous character items from Vault, localStorage, and stale scenes on every new search!
+    const cleanTargetChar = cleanCharacterNameForSearch(cleanQuery) || cleanQuery;
+    const isNewChar = resetWorkspaceForNewCharacter(cleanTargetChar, { forceClear: true });
+    const cleanedScenes = isNewChar
+      ? stripOldCharacterMediaFromScenes(scenes, cleanTargetChar)
+      : scenes;
+    if (isNewChar) {
+      setScenes(cleanedScenes);
+      setSettings((prev) => ({
+        ...prev,
+        projectTitle: cleanTargetChar.slice(0, 45),
+      }));
+    }
+
     try {
       const {
         updatedScenes,
@@ -317,20 +386,26 @@ export default function App() {
         matchedVideosCount,
         matchedPhotosCount,
         missingCount,
-      } = await matchAndAssignRealPhotosForScenes(scenes, characterQuery);
+      } = await matchAndAssignRealPhotosForScenes(
+        cleanedScenes,
+        cleanTargetChar,
+        undefined,
+        undefined,
+        true
+      );
       if (matchedCount > 0 || missingCount > 0) {
         setScenes(updatedScenes);
       }
-      const items = await fetchArchivalPhotosInternal(characterQuery);
+      const items = await fetchArchivalPhotosInternal(cleanTargetChar, true, updatedScenes);
       const imageItemsCount = items.filter((it) => it.type === 'image').length;
       const totalFound = matchedCount + items.length;
       if (totalFound > 0) {
         setStatusBanner(
-          `Đã tìm được ${Math.max(matchedPhotosCount, imageItemsCount)} Ảnh Nhân Vật phong phú theo từng giai đoạn cốt truyện & ${matchedVideosCount} Video Thật — gắn trực tiếp vào các phân cảnh và bổ sung vào Kho Tư Liệu!`
+          `Đã xóa nhân vật cũ & tìm được ${Math.max(matchedPhotosCount, imageItemsCount)} Ảnh Nhân Vật "${cleanTargetChar}" & ${matchedVideosCount} Video Thật — gắn trực tiếp vào các phân cảnh và Kho Tư Liệu!`
         );
       } else {
         setStatusBanner(
-          `Không tìm thấy ảnh/video công khai cho "${characterQuery}". Đã tạo sẵn trọn bộ Prompt Ảnh & Video Kling AI để bạn vẽ và reg video ngay!`
+          `Không tìm thấy ảnh/video công khai cho "${cleanTargetChar}". Đã tạo sẵn trọn bộ Prompt Ảnh & Video Kling AI để bạn vẽ và reg video ngay!`
         );
       }
     } finally {
@@ -347,10 +422,14 @@ export default function App() {
     if (isTrimmingRealVideos) return;
     const rawTopic =
       characterQuery?.trim() ||
+      settings.projectTitle.split('—')[0].trim() ||
       loadSavedAudioPreferences().storyTopic ||
       getCharacterNameForPreset(settings.activePresetId) ||
-      settings.projectTitle.split('—')[0].trim() ||
       'Will Sampson';
+
+    if (!targetCurrentSceneOnly) {
+      resetWorkspaceForNewCharacter(rawTopic);
+    }
 
     const currentCycle = targetCurrentSceneOnly ? videoCutCycleRef.current : videoCutCycleRef.current++;
     setIsTrimmingRealVideos(true);
@@ -1217,6 +1296,9 @@ export default function App() {
     const presetScenes = PRESET_SCENES_MAP[presetId];
     if (!presetMeta || !presetScenes) return;
 
+    const charName = getCharacterNameForPreset(presetId);
+    resetWorkspaceForNewCharacter(charName, { forceClear: true });
+
     setIsPlaying(false);
     setScenes(presetScenes);
     setActiveSceneId(presetScenes[0].id);
@@ -1229,25 +1311,30 @@ export default function App() {
       audioMode: 'stitched-scenes',
     }));
 
-    const charName = getCharacterNameForPreset(presetId);
     saveAudioPreferences({ storyTopic: charName });
     const { updatedScenes, matchedVideosCount, matchedPhotosCount } =
-      await matchAndAssignRealPhotosForScenes(presetScenes, charName);
+      await matchAndAssignRealPhotosForScenes(presetScenes, charName, undefined, undefined, true);
     setScenes(updatedScenes);
     setStatusBanner(
       `Đã tải ${presetMeta.title}: Tự động lấy ${matchedVideosCount} Video Thật & ${matchedPhotosCount} Ảnh Thật trên mạng gắn vào các phân cảnh!`
     );
   };
 
-  // Automatically hydrate initial preset scenes with real web photos & videos on first load (without overwriting user-cut scenes!)
+  // Automatically hydrate initial preset scenes with real web photos & videos on first load (without overwriting user-cut scenes OR a newer character search!)
   useEffect(() => {
     let cancelled = false;
+    const mountEpoch = characterEpochRef.current;
 
-    // Also hydrate saved cuts from server into Media Vault on mount
+    // Also hydrate saved cuts from server into Media Vault on mount (only if user hasn't started a new character search)
     fetch('/api/youtube/saved-cuts')
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        if (!cancelled && Array.isArray(data?.savedCuts) && data.savedCuts.length > 0) {
+        if (
+          !cancelled &&
+          characterEpochRef.current === mountEpoch &&
+          Array.isArray(data?.savedCuts) &&
+          data.savedCuts.length > 0
+        ) {
           const serverVaultCuts: VaultItem[] = data.savedCuts.map(
             (cut: CutYouTubeResultItem, i: number) => ({
               id: cut.id,
@@ -1276,7 +1363,7 @@ export default function App() {
         scenes,
         charName
       );
-      if (!cancelled && matchedCount > 0) {
+      if (!cancelled && characterEpochRef.current === mountEpoch && matchedCount > 0) {
         setScenes((prevScenes) =>
           updatedScenes.map((uScene, idx) => {
             const currentScene = prevScenes.find((ps) => ps.id === uScene.id) || prevScenes[idx];
@@ -2062,7 +2149,8 @@ export default function App() {
     targetScenes: StoryScene[],
     topicHint: string,
     overrideStoryMode?: StoryTopicMode,
-    customPrimaryRefUrl?: string
+    customPrimaryRefUrl?: string,
+    replaceVault = false
   ): Promise<{
     updatedScenes: StoryScene[];
     matchedCount: number;
@@ -2327,14 +2415,17 @@ export default function App() {
 
       if (newVaultItems.length > 0) {
         setVaultItems((prev) => {
-          const existingKeys = new Set(prev.map((item) => (item.url || '').slice(0, 120)));
+          const base = replaceVault
+            ? prev.filter((item) => item.id.startsWith('custom-attach-'))
+            : prev;
+          const existingKeys = new Set(base.map((item) => (item.url || '').slice(0, 120)));
           const fresh = newVaultItems.filter((item) => {
             const k = (item.url || '').slice(0, 120);
             if (!k || existingKeys.has(k)) return false;
             existingKeys.add(k);
             return true;
           });
-          return [...fresh, ...prev];
+          return [...fresh, ...base];
         });
       }
 
@@ -2919,6 +3010,11 @@ export default function App() {
     setIsPlaying(false);
     setStatusBanner(null);
 
+    // Wipe previous character from Vault & localStorage before generating the new character's project
+    resetWorkspaceForNewCharacter(characterOrTopic || cleanSummary.slice(0, 45), {
+      forceClear: true,
+    });
+
     const chosenVoice = overrideVoice || settings.ttsVoice || 'Charon';
     const chosenMusic = overrideMusicStyle || settings.bgMusicStyle || 'western-acoustic';
     const chosenVol =
@@ -3047,7 +3143,8 @@ export default function App() {
         initialScenes,
         effectiveTopic,
         resolvedModeFromServer,
-        customImages?.[0]?.url
+        customImages?.[0]?.url,
+        true
       );
       setScenes(scenesWithRealPhotos);
 
@@ -3096,6 +3193,11 @@ export default function App() {
 
     setIsGeneratingStory(true);
     setStatusBanner(null);
+
+    // Wipe all old characters before generating the new character story
+    resetWorkspaceForNewCharacter(topic || cleanSummary.slice(0, 45), {
+      forceClear: true,
+    });
 
     saveAudioPreferences({
       voiceLanguage: lang,
@@ -3199,7 +3301,8 @@ export default function App() {
         initialScenes,
         effectiveTopic,
         resolvedModeFromServer,
-        customImages?.[0]?.url
+        customImages?.[0]?.url,
+        true
       );
       setScenes(updatedScenes);
       setIsPromptStudioOpen(true);

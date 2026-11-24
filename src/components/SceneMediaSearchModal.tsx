@@ -32,6 +32,10 @@ import {
   type ClearFaceSearchMode,
 } from '../utils/clearFaceScenePlanner';
 import { downloadFullFrameImageForGrok } from '../utils/fullFrameHelper';
+import {
+  doesMediaLabelMatchCharacter,
+  isDifferentCharacterSession,
+} from '../utils/characterSessionReset';
 
 export interface SceneVideoOption {
   id: string;
@@ -210,6 +214,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
   const [activeScrubberCardId, setActiveScrubberCardId] = useState<string | null>(null);
   const archivalVideoRefs = React.useRef<Record<string, HTMLVideoElement | null>>({});
   const resultsBodyRef = React.useRef<HTMLDivElement | null>(null);
+  const searchRequestIdRef = React.useRef<number>(0);
 
   const stopAllInlinePreviewStreams = () => {
     setActiveScrubberCardId(null);
@@ -361,50 +366,11 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     return stripped.length >= 3 ? stripped : cleanCharName;
   }, [searchQuery, cleanCharName]);
 
-  // Filter saved cuts to only show cuts belonging to the currently active character/subject (prevents showing Will Sampson's Cuckoo's Nest cut when working on Clint Eastwood!)
+  // Strictly filter saved cuts to ONLY show cuts belonging to the currently active character (wipes all previous characters cleanly!)
   const visibleSavedCuts = React.useMemo(() => {
-    const lowerActive = activeCharName.toLowerCase();
-    const otherKnownActors = [
-      'will sampson',
-      'chief bromden',
-      "cuckoo's nest",
-      'cuckoos nest',
-      'the chief learns to dunk',
-      'steve mcqueen',
-      'bullitt',
-      'clint eastwood',
-      'john wayne',
-      'bruce lee',
-      'elvis presley',
-      'audrey hepburn',
-      'lorne greene',
-      'clayton moore',
-      'yul brynner',
-    ];
     return savedCuts.filter((cut) => {
-      const cutChar = (cut.characterName || '').toLowerCase();
-      const cutTitle = (cut.title || '').toLowerCase();
-      if (cutChar) {
-        return cutChar.includes(lowerActive) || lowerActive.includes(cutChar);
-      }
-      // If legacy cut has no characterName tag, check if it explicitly belongs to a different known actor
-      const belongsToOtherActor = otherKnownActors.some((actorKeyword) => {
-        if (lowerActive.includes(actorKeyword)) return false;
-        if (
-          lowerActive.includes('will sampson') &&
-          (actorKeyword === 'chief bromden' ||
-            actorKeyword === "cuckoo's nest" ||
-            actorKeyword === 'cuckoos nest' ||
-            actorKeyword === 'the chief learns to dunk')
-        ) {
-          return false;
-        }
-        if (lowerActive.includes('steve mcqueen') && actorKeyword === 'bullitt') {
-          return false;
-        }
-        return cutTitle.includes(actorKeyword);
-      });
-      return !belongsToOtherActor;
+      const label = `${cut.characterName || ''} ${cut.title || ''}`.trim();
+      return doesMediaLabelMatchCharacter(label, activeCharName);
     });
   }, [savedCuts, activeCharName]);
 
@@ -541,9 +507,20 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     overrideDepth?: 'all' | 'cinema' | 'interview' | 'rare' | 'archive' | 'social'
   ) => {
     const activeDepth = overrideDepth || searchDepth;
+    const reqId = ++searchRequestIdRef.current;
+
     if (appendMode) {
       setIsLoadingMore(true);
     } else {
+      // Immediately wipe all previous character's videos, photos, queues & banners on every fresh search!
+      stopAllInlinePreviewStreams();
+      setVideoOptions([]);
+      setPhotoOptions([]);
+      setYoutubeVideos([]);
+      setQueuedSegments([]);
+      setLatestAcceptedCut(null);
+      setJustCutBanner(null);
+      setPhotoFocusMode('all');
       setIsLoading(true);
     }
     setIsLoadingArchival(true);
@@ -559,17 +536,6 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
       .replace(/\s+/g, ' ')
       .trim();
     const effectiveCharForSearch = strippedSubject.length >= 3 ? strippedSubject : cleanCharName;
-
-    // Clear any stale accepted cut banner if it belongs to a different character
-    setLatestAcceptedCut((prev) => {
-      if (!prev) return null;
-      const prevChar = (prev.characterName || prev.title || '').toLowerCase();
-      if (!prevChar.includes(effectiveCharForSearch.toLowerCase())) {
-        setJustCutBanner(null);
-        return null;
-      }
-      return prev;
-    });
 
     const targetSceneForDefault =
       overrideSceneId ||
@@ -662,20 +628,23 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
         videoLimit: 14,
         cycleOffset: nextCycle,
         photoFocusMode: 'all',
-        sceneContext: effectiveScene
-          ? {
-              id: effectiveScene.id,
-              order: effectiveScene.order,
-              title: effectiveScene.title,
-              narrationText: effectiveScene.narrationText,
-              archivalKeywords: effectiveScene.archivalKeywords,
-            }
-          : null,
+        sceneContext:
+          effectiveScene && !isDifferentCharacterSession(cleanCharName, effectiveCharForSearch)
+            ? {
+                id: effectiveScene.id,
+                order: effectiveScene.order,
+                title: effectiveScene.title,
+                narrationText: effectiveScene.narrationText,
+                archivalKeywords: effectiveScene.archivalKeywords,
+              }
+            : null,
       }),
     })
       .then(async (archRes) => {
+        if (searchRequestIdRef.current !== reqId) return;
         if (!archRes.ok) return;
         const data = await archRes.json();
+        if (searchRequestIdRef.current !== reqId) return;
         const vids: SceneVideoOption[] = Array.isArray(data?.videoOptions)
           ? data.videoOptions
           : [];
@@ -727,10 +696,10 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
             setArchivalTargetScenes((prev) => ({ ...nextArchTargets, ...prev }));
           }
         } else {
-          setCustomTrimStarts((prev) => ({ ...initialTrims, ...prev }));
-          setCustomTrimEnds((prev) => ({ ...initialTrimEnds, ...prev }));
+          setCustomTrimStarts(initialTrims);
+          setCustomTrimEnds(initialTrimEnds);
           if (targetSceneForDefault) {
-            setArchivalTargetScenes((prev) => ({ ...nextArchTargets, ...prev }));
+            setArchivalTargetScenes(nextArchTargets);
           }
         }
         // Do NOT auto-spawn hidden <video preload="auto"> thumbnail extractors on modal open —
@@ -738,13 +707,16 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
       })
       .catch(() => {})
       .finally(() => {
-        setIsLoadingArchival(false);
+        if (searchRequestIdRef.current === reqId) {
+          setIsLoadingArchival(false);
+        }
       });
 
     // 2. Fetch Deep Multi-Source External Videos (YouTube 7 angles + Shorts + TikTok + Instagram + Archive.org MP4 + Dailymotion)
     try {
       let ytList: YouTubeSearchVideoItem[] = [];
       for (let attempt = 0; attempt < 2; attempt++) {
+        if (searchRequestIdRef.current !== reqId) return;
         const ytRes = await fetch('/api/youtube/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -762,12 +734,16 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
           if (ytList.length > 0) break;
         }
       }
-      applyYtList(ytList);
+      if (searchRequestIdRef.current === reqId) {
+        applyYtList(ytList);
+      }
     } catch {
-      // Keep existing options
+      // Keep cleared state on failed search
     } finally {
-      setIsLoading(false);
-      setIsLoadingMore(false);
+      if (searchRequestIdRef.current === reqId) {
+        setIsLoading(false);
+        setIsLoadingMore(false);
+      }
     }
   };
 
@@ -800,32 +776,38 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     append = true
   ) => {
     if (isLoadingClearFacePhotos) return;
+    const reqId = searchRequestIdRef.current;
     setIsLoadingClearFacePhotos(true);
+    if (!append) {
+      setPhotoOptions([]);
+    }
     try {
-      const effectiveQuery = searchQuery.trim() || cleanCharName;
+      const effectiveQuery = searchQuery.trim() || activeCharName || cleanCharName;
+      const targetChar = activeCharName || cleanCharName;
       const res = await fetch('/api/archival/search-scene-media', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query: effectiveQuery,
-          characterName: cleanCharName,
+          characterName: targetChar,
           sceneDurationSec: sceneDur,
-          limit: 18,
+          limit: 16,
           cycleOffset: append ? cycleOffset + 1 : 0,
           photoFocusMode: mode,
           skipVideos: true,
-          sceneContext: effectiveScene
-            ? {
-                id: effectiveScene.id,
-                order: effectiveScene.order,
-                title: effectiveScene.title,
-                narrationText: effectiveScene.narrationText,
-                archivalKeywords: effectiveScene.archivalKeywords,
-              }
-            : null,
+          sceneContext:
+            effectiveScene && !isDifferentCharacterSession(cleanCharName, targetChar)
+              ? {
+                  id: effectiveScene.id,
+                  order: effectiveScene.order,
+                  title: effectiveScene.title,
+                  narrationText: effectiveScene.narrationText,
+                  archivalKeywords: effectiveScene.archivalKeywords,
+                }
+              : null,
         }),
       });
-      if (res.ok) {
+      if (res.ok && searchRequestIdRef.current === reqId) {
         const data = await res.json();
         const imgs: ScenePhotoOption[] = Array.isArray(data?.photoOptions)
           ? data.photoOptions
@@ -871,6 +853,17 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
       stopAllInlinePreviewStreams();
     }
   }, [isOpen, scene?.id, initialTab, cleanCharName]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, onClose]);
 
   // Auto-stop the preview player inside the card right when the selected (startSec -> endSec) segment finishes!
   useEffect(() => {
@@ -1465,8 +1458,14 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     }
   };
 
+  // Only include Vault photos that strictly match the currently searched character (never leak old characters!)
   const vaultPhotoExtras: ScenePhotoOption[] = vaultItems
-    .filter((v) => v.type === 'image' && v.url)
+    .filter(
+      (v) =>
+        v.type === 'image' &&
+        v.url &&
+        doesMediaLabelMatchCharacter(`${v.name || ''} ${v.createdAt || ''}`, activeCharName)
+    )
     .slice(0, 6)
     .map((v) => ({
       id: `vault-extra-${v.id}`,
@@ -1625,6 +1624,8 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
             <button
               type="button"
               onClick={onClose}
+              aria-label="Đóng cửa sổ tìm kiếm"
+              title="Đóng (Esc)"
               className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
             >
               <X className="w-4 h-4" />
@@ -1871,10 +1872,11 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                 setCycleOffset(0);
                 executeSearch(qRaw, 0, effectiveScene?.id, false, 'social');
               } else {
-                if (filterTab !== 'youtube' && filterTab !== 'all') {
+                if (filterTab !== 'youtube' && filterTab !== 'all' && filterTab !== 'image') {
                   setFilterTab('youtube');
                 }
-                executeSearch(searchQuery, cycleOffset);
+                setCycleOffset(0);
+                executeSearch(searchQuery, 0, effectiveScene?.id, false);
               }
             }}
             className="flex items-center gap-2"
@@ -1892,13 +1894,13 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
 
             <button
               type="submit"
-              disabled={isLoading || isLoadingMore}
+              disabled={isLoadingMore}
               className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white transition-colors shrink-0"
             >
               {isLoading ? (
                 <>
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  <span>Đang tìm chuyên sâu đa nguồn...</span>
+                  <span>Đang tìm... (Bấm để tìm mới)</span>
                 </>
               ) : (
                 <>

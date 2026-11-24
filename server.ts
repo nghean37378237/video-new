@@ -2648,7 +2648,17 @@ For every scene, ensure smooth chronological transitions from one scene to the n
   async function detectCollageOrCompositeImage(
     buf: Buffer
   ): Promise<{ isCollage: boolean; reason?: string }> {
+    const hasFfmpeg = await checkFfmpegAvailable();
+    if (!hasFfmpeg) {
+      return { isCollage: false };
+    }
     return new Promise((resolve) => {
+      let settled = false;
+      const done = (resVal: { isCollage: boolean; reason?: string }) => {
+        if (settled) return;
+        settled = true;
+        resolve(resVal);
+      };
       try {
         const W = 128;
         const H = 128;
@@ -2672,26 +2682,30 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           try {
             p.kill();
           } catch {}
-          resolve({ isCollage: false });
-        }, 2200);
+          done({ isCollage: false });
+        }, 1800);
+        p.on("error", () => {
+          clearTimeout(timer);
+          done({ isCollage: false });
+        });
         p.stdout.on("data", (c: Buffer) => chunks.push(c));
         p.on("close", () => {
           clearTimeout(timer);
           const raw = Buffer.concat(chunks);
-          if (raw.length < W * H * 3) return resolve({ isCollage: false });
+          if (raw.length < W * H * 3) return done({ isCollage: false });
           const analysis = analyzeRawRgbForSplitOrBadFraming(raw, W, H);
           if (analysis.isSplitCollage) {
-            return resolve({
+            return done({
               isCollage: true,
               reason: analysis.reason,
             });
           }
-          resolve({ isCollage: false });
+          done({ isCollage: false });
         });
         p.stdin.on("error", () => {});
         p.stdin.end(buf);
       } catch {
-        resolve({ isCollage: false });
+        done({ isCollage: false });
       }
     });
   }
@@ -2712,7 +2726,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     for (const targetUrl of urlsToTry) {
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 3000);
+        const timeout = setTimeout(() => controller.abort(), 2300);
         const isWiki =
           targetUrl.includes("wikimedia.org") || targetUrl.includes("wikipedia.org");
         const imgRes = await fetch(targetUrl, {
@@ -2925,13 +2939,13 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           `https://duckduckgo.com/?q=${encodeURIComponent(ddgQuery)}&iax=images&ia=images`,
           {
             headers: { "User-Agent": BROWSER_USER_AGENT, "Accept-Language": "en-US,en;q=0.9" },
-            signal: AbortSignal.timeout(3200),
+            signal: AbortSignal.timeout(2000),
           }
         );
         const h1 = r1.ok ? await r1.text() : "";
         const vqdMatch = h1.match(/vqd=["']?([0-9-]+)["']?/);
         if (!vqdMatch) return [];
-        await new Promise((r) => setTimeout(r, 250));
+        await new Promise((r) => setTimeout(r, 150));
         const r2 = await fetch(
           `https://duckduckgo.com/i.js?l=us-en&o=json&q=${encodeURIComponent(
             ddgQuery
@@ -2941,7 +2955,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
               "User-Agent": BROWSER_USER_AGENT,
               Referer: "https://duckduckgo.com/",
             },
-            signal: AbortSignal.timeout(3500),
+            signal: AbortSignal.timeout(2200),
           }
         );
         if (r2.status === 202 || r2.status === 403 || r2.status === 429) {
@@ -3004,7 +3018,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           "Accept-Language": "en-US,en;q=0.9",
           Accept: "text/html,application/xhtml+xml",
         },
-        signal: AbortSignal.timeout(4800),
+        signal: AbortSignal.timeout(3200),
       });
       if (!res.ok) return [];
       const html = await res.text();
@@ -3364,10 +3378,10 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     }
 
     let ddgCallCount = 0;
-    const maxDdgCalls = options?.maxDdgCalls ?? 2;
+    const maxDdgCalls = options?.maxDdgCalls ?? 1;
 
-    for (const q of candidateQueries) {
-      if (candidates.length >= limit * 2 + 6) break;
+    for (const q of candidateQueries.slice(0, 2)) {
+      if (candidates.length >= limit + 5) break;
 
       const cleanedQ = q
         .replace(/\b(happy|birthday|wishes|collage|composite|montage|grid)\b/gi, " ")
@@ -3393,20 +3407,21 @@ For every scene, ensure smooth chronological transitions from one scene to the n
 
       // Run Bing Face/Portrait Images + DuckDuckGo (rate-guarded) + Openverse + Wikipedia PageImages + Wikimedia Commons in parallel!
       const [bingList, ddgList, ovList, wpList, wmList] = await Promise.all([
-        // 0. Bing Face / Portrait Images (native face-face for movie stills & activities, face-portrait for studio portraits!)
+        // 0. Bing Face / Portrait Images (fast single primary call, with broad photo-only fallback if <4 hits!)
         (async () => {
           const out: typeof candidates = [];
           try {
-            const [primaryBing, secondaryBing] =
-              bingFaceMode === "face"
-                ? await Promise.all([
-                    runBingImageSearchCached(bingQuery, { faceMode: "face", tallAspect: false }),
-                    runBingImageSearchCached(bingQuery, { faceMode: "face", tallAspect: true }),
-                  ])
-                : await Promise.all([
-                    runBingImageSearchCached(bingQuery, { faceMode: "portrait", tallAspect: true }),
-                    runBingImageSearchCached(bingQuery, { faceMode: "portrait", tallAspect: false }),
-                  ]);
+            const primaryBing = await runBingImageSearchCached(bingQuery, {
+              faceMode: bingFaceMode,
+              tallAspect: bingFaceMode === "portrait",
+            });
+            const secondaryBing =
+              primaryBing.length < 4
+                ? await runBingImageSearchCached(bingQuery, {
+                    faceMode: bingFaceMode === "portrait" ? "face" : "none",
+                    tallAspect: false,
+                  })
+                : [];
             const seenBing = new Set<string>();
             const mergedBing = [...primaryBing, ...secondaryBing].filter((item) => {
               if (!item.imageUrl || seenBing.has(item.imageUrl)) return false;
@@ -3684,7 +3699,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     // Sort highest-scoring clean photos first before downloading & pixel-inspecting
     candidates.sort((a, b) => b.score - a.score);
 
-    const poolToVerify = candidates.slice(0, Math.min(candidates.length, limit * 3 + 8));
+    const poolToVerify = candidates.slice(0, Math.min(candidates.length, limit * 2 + 3));
     const verified: VerifiedStagePhotoCandidate[] = [];
 
     const resolvedBatch = await Promise.all(
@@ -4255,6 +4270,20 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       const safeStart = Math.max(2, Math.round(startSec || 18));
       const safeDur = Math.max(4, Math.min(20, Math.round(durationSec || 8)));
       const safeEnd = safeStart + safeDur;
+
+      // In serverless environments without FFmpeg (e.g. Vercel), return a direct streamable proxy segment immediately
+      const hasFfmpeg = await checkFfmpegAvailable();
+      if (!hasFfmpeg) {
+        return {
+          videoUrl: `/api/archival/video-stream?url=${encodeURIComponent(cleanSource)}#cut=${idx + 1}&t=${safeStart},${safeEnd}`,
+          frameDataUrl: "",
+          trimStartSec: safeStart,
+          trimEndSec: safeEnd,
+          originalStartSec: safeStart,
+          originalEndSec: safeEnd,
+        };
+      }
+
       const urlSlug = Buffer.from(cleanSource)
         .toString("base64")
         .replace(/[^a-zA-Z0-9]/g, "")
@@ -4698,22 +4727,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       });
     }
 
-    if (candidates.length === 0) {
-      const fallbackReels = VERIFIED_ACTOR_REAL_VIDEO_REELS["will sampson"] || [];
-      const baseShift = (Math.max(0, cycleOffset) % 5) * 14;
-      fallbackReels.forEach((r, idx) => {
-        candidates.push({
-          title: `${subjectFullPhrase} — ${r.title}`,
-          videoUrl: `/api/archival/video-stream?url=${encodeURIComponent(r.rawMp4Url)}#cut=${idx + 1}`,
-          thumbUrl: "",
-          width: r.width,
-          height: r.height,
-          year: r.year,
-          trimStartSec: r.trimStartSec + baseShift,
-          trimEndSec: r.trimEndSec + baseShift,
-        });
-      });
-    }
+    // NEVER inject another actor's videos (such as Will Sampson) when searching a different character!
+    // If Archive.org + Wikimedia returned 0 videos for this character, leave candidates empty cleanly.
 
     const expandedCandidates: typeof candidates = [];
     if (candidates.length > 0) {
@@ -5189,7 +5204,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         cleanChar || propChar,
         sceneContext && typeof sceneContext === "object" ? sceneContext : null,
         effectiveFocusMode,
-        { maxQueries: effectiveFocusMode === "all" ? 5 : 4 }
+        { maxQueries: effectiveFocusMode === "all" ? 4 : 3 }
       );
 
       // Rotate slightly on subsequent pages (cycleOffset > 0) so users get fresh stills when clicking "Load More"
@@ -5202,8 +5217,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           : clearFacePlans;
 
       const perPlanLimit = Math.max(
-        5,
-        Math.ceil((Math.max(12, Number(limit) || 16) + 4) / Math.max(1, rotatedPlans.length))
+        4,
+        Math.ceil((Math.max(10, Number(limit) || 14) + 2) / Math.max(1, rotatedPlans.length))
       );
 
       const [videos, clearFacePhotoLists, contextualPhotos] = await Promise.all([
@@ -5234,7 +5249,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 stage: plan.stage,
                 stageLabel: plan.stageLabelVi,
                 skipCanonical: idx > 0 || effectiveFocusMode === "film-still" || effectiveFocusMode === "activity-scene",
-                maxDdgCalls: idx < 2 ? 1 : 0,
+                maxDdgCalls: idx === 0 ? 1 : 0,
               }
             )
           )
@@ -5336,7 +5351,25 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         })(),
       ]);
 
-      const flattenedClearFace = clearFacePhotoLists.flat();
+      let flattenedClearFace = clearFacePhotoLists.flat();
+      // Fast safety net: if filtered clear-face plans returned < 4 photos, run one clean broad fallback for the same character
+      if (flattenedClearFace.length + contextualPhotos.length < 4 && (cleanChar || propChar)) {
+        const broadFallback = await searchRealArchivalPhotos(
+          cleanChar || propChar,
+          10,
+          usedUrls,
+          anchorForSearch || cleanChar || propChar,
+          usedTitles,
+          {
+            allowContextualScenes: true,
+            bingFaceMode: "face",
+            allowClassicStillAspect: true,
+            skipCanonical: false,
+            maxDdgCalls: 0,
+          }
+        );
+        flattenedClearFace = [...flattenedClearFace, ...broadFallback];
+      }
       const balancedPhotos = sortAndBalanceClearFacePhotos(
         [...flattenedClearFace, ...contextualPhotos],
         effectiveFocusMode
@@ -7711,19 +7744,25 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       const stagePlans = buildRichStagePhotoQueries(
         cleanChar,
         Array.isArray(scenes) ? scenes : [],
-        { storyMode: String(storyMode || "biography"), maxQueries: 6 }
+        { storyMode: String(storyMode || "biography"), maxQueries: 5 }
       );
-      const perStageLimit = Math.max(5, Math.ceil(targetLimit / Math.max(1, stagePlans.length)) + 2);
+      const perStageLimit = Math.max(4, Math.ceil(targetLimit / Math.max(1, stagePlans.length)) + 1);
 
       const [videos, ...stagePhotoBatches] = await Promise.all([
         searchRealArchivalVideos(cleanChar, 3, usedUrls, cleanChar, usedTitles),
         ...stagePlans.map((plan, idx) =>
           searchRealArchivalPhotos(plan.query, perStageLimit, usedUrls, cleanChar, usedTitles, {
             allowContextualScenes: plan.allowMultiSubject,
+            bingFaceMode:
+              plan.stage === "peak-cinema" || plan.stage === "personal-behind-scenes"
+                ? "face"
+                : "portrait",
+            allowClassicStillAspect:
+              plan.stage === "peak-cinema" || plan.stage === "personal-behind-scenes",
             stage: plan.stage,
             stageLabel: plan.stageLabelVi,
             skipCanonical: idx > 0,
-            maxDdgCalls: idx < 2 ? 1 : 0,
+            maxDdgCalls: idx === 0 ? 1 : 0,
           })
         ),
       ]);
@@ -8198,12 +8237,12 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           : buildRichStagePhotoQueries(cleanTopic, visualScenes, {
               storyMode: String(storyMode || "biography"),
               secondaryPerson,
-              maxQueries: isSingleSceneQuickLookup ? 4 : 8,
+              maxQueries: isSingleSceneQuickLookup ? 3 : 6,
             });
 
         const perStageLimit = isSingleSceneQuickLookup
-          ? 6
-          : Math.max(5, Math.ceil((visualScenes.length * 2) / Math.max(1, stagePlans.length)) + 2);
+          ? 5
+          : Math.max(4, Math.ceil((visualScenes.length * 2) / Math.max(1, stagePlans.length)) + 1);
 
         const [foundVideos, ...eraPhotoLists] = await Promise.all([
           skipVideoCuts || isSingleSceneQuickLookup
@@ -8233,7 +8272,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 stage: plan.stage,
                 stageLabel: plan.stageLabelVi,
                 skipCanonical: idx > 0,
-                maxDdgCalls: idx < 2 ? 1 : 0,
+                maxDdgCalls: idx === 0 ? 1 : 0,
               }
             );
           }),
@@ -8315,8 +8354,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         }
       }
 
-      // If we still want richer per-scene coverage, query additional unique scene archivalKeywords in parallel
-      if (verifiedPool.length < Math.max(visualScenes.length + 4, 14)) {
+      // Only run extra per-scene lookup if initial multi-stage pool is still thin (< 8)
+      if (verifiedPool.length < Math.min(8, Math.max(visualScenes.length, 6))) {
         const extraSceneEntries = visualScenes
           .map((sc: any, idx: number) => ({
             sc,
@@ -8333,18 +8372,20 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             seenKw.add(k);
             return true;
           })
-          .slice(0, 6);
+          .slice(0, 3);
 
         const extraResults = await Promise.all(
           extraTargets.map(({ kw, analysis }) =>
             searchRealArchivalPhotos(
               kw,
-              5,
+              4,
               usedUrls,
               isFilmCastMode ? kw.split(" ").slice(0, 2).join(" ") : cleanTopic || kw,
               usedTitleKeys,
               {
                 allowContextualScenes: analysis.allowContextualMultiPerson,
+                bingFaceMode: "face",
+                allowClassicStillAspect: true,
                 stage: analysis.stage,
                 stageLabel: analysis.stageLabelVi,
                 skipCanonical: true,

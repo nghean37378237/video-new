@@ -259,6 +259,14 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
     savedStoryTopic: savedAudioPrefs.storyTopic,
   });
 
+  const normalizedInspectorCharKey = cleanCharacterNameForSearch(resolvedActiveCharacterName).toLowerCase();
+  useEffect(() => {
+    setStagePhotoOptionsByScene({});
+    setSeenScenePhotoUrls({});
+    setActivePhotoCatFilter('all');
+    setClearFaceStatusNote(null);
+  }, [normalizedInspectorCharKey]);
+
   const activeSceneStageInfo = activeScene
     ? classifySceneStoryStage(
         activeScene,
