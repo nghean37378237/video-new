@@ -36,6 +36,10 @@ import {
   doesMediaLabelMatchCharacter,
   isDifferentCharacterSession,
 } from '../utils/characterSessionReset';
+import {
+  isDrawingOrIllustrationPhoto,
+  isPosedPortraitOrHeadshotPhoto,
+} from '../utils/storyStagePhotoPlanner';
 
 export interface SceneVideoOption {
   id: string;
@@ -1486,15 +1490,19 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
     ]
       .filter((p) => {
         if (nonCompositeSoloRegex.test(p.title || '')) return false;
+        if (isDrawingOrIllustrationPhoto(p.title || '', p.sourceUrl || '')) return false;
+        if (isPosedPortraitOrHeadshotPhoto(p.title || '', p.sourceUrl || '')) return false;
         const w = p.width || 720;
         const h = p.height || 960;
-        // Allow vertical portraits AND classic 4:3 / 3:2 / 35mm clear-face film stills & activity frames (reject 16:9 split banners)
+        // Allow classic 4:3 / 3:2 / 35mm movie stills & real-life candid frames (reject ultra-wide split banners)
         if (w / Math.max(1, h) > 1.62) return false;
         return true;
       })
       .map((p) => {
         const cat =
-          p.photoCategory || classifyClearFacePhotoCategory(p.title, p.sourceUrl || '');
+          p.photoCategory && p.photoCategory !== 'portrait'
+            ? p.photoCategory
+            : classifyClearFacePhotoCategory(p.title, p.sourceUrl || '');
         return {
           ...p,
           photoCategory: cat,
@@ -1514,9 +1522,6 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
   ).length;
   const activitySceneCount = allCleanClearFacePhotos.filter(
     (p) => p.photoCategory === 'activity-scene'
-  ).length;
-  const portraitPhotoCount = allCleanClearFacePhotos.filter(
-    (p) => p.photoCategory === 'portrait'
   ).length;
 
   return (
@@ -4093,7 +4098,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                     <h3 className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
                       <ImageIcon className="w-4 h-4 text-emerald-400" />
                       <span>
-                        Ảnh Nhân Vật Rõ Mặt (Cảnh Phim, Hoạt Động &amp; Chân Dung) Để Reg Video — Cảnh {sceneNumLabel} ({combinedPhotos.length} ảnh)
+                        Ảnh Thực Tế &amp; Ảnh Trong Cảnh Phim (Đã Loại Ảnh Vẽ &amp; Chân Dung) — Cảnh {sceneNumLabel} ({combinedPhotos.length} ảnh)
                       </span>
                     </h3>
                     <button
@@ -4105,40 +4110,35 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                       {isLoadingClearFacePhotos ? (
                         <>
                           <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          <span>Đang bổ sung ảnh rõ mặt...</span>
+                          <span>Đang bổ sung ảnh thực tế &amp; cảnh phim...</span>
                         </>
                       ) : (
                         <>
                           <RefreshCw className="w-3.5 h-3.5" />
-                          <span>+ Bổ Sung Ảnh Cảnh Phim &amp; Hoạt Động Rõ Mặt</span>
+                          <span>+ Bổ Sung Ảnh Thực Tế &amp; Cảnh Phim</span>
                         </>
                       )}
                     </button>
                   </div>
 
-                  {/* Category Filter Pills for Movie Stills / Real-Life Activities / Portraits */}
+                  {/* Category Filter Tabs: Real Film Stills & Real-Life Candid Photos ONLY (No Drawings / Studio Portraits) */}
                   <div className="flex flex-wrap items-center gap-1.5">
                     {(
                       [
                         {
                           id: 'all' as const,
-                          label: `✨ Tất Cả Rõ Mặt (${allCleanClearFacePhotos.length})`,
+                          label: `✨ Tất Cả Thực Tế & Phim (${allCleanClearFacePhotos.length})`,
                           count: allCleanClearFacePhotos.length,
                         },
                         {
                           id: 'film-still' as const,
-                          label: `🎬 Cảnh Phim Rõ Mặt (${filmStillCount})`,
+                          label: `🎬 Ảnh Trong Cảnh Phim (${filmStillCount})`,
                           count: filmStillCount,
                         },
                         {
                           id: 'activity-scene' as const,
-                          label: `🎯 Hoạt Động & Hậu Trường (${activitySceneCount})`,
+                          label: `📸 Ảnh Thực Tế & Hậu Trường (${activitySceneCount})`,
                           count: activitySceneCount,
-                        },
-                        {
-                          id: 'portrait' as const,
-                          label: `👤 Chân Dung Cận Mặt (${portraitPhotoCount})`,
-                          count: portraitPhotoCount,
                         },
                       ]
                     ).map((catBtn) => {
@@ -4169,7 +4169,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                     <div className="rounded-lg border border-slate-800 bg-slate-900/70 p-4 text-center space-y-2">
                       <p className="text-xs text-slate-300">
                         {isLoadingClearFacePhotos
-                          ? 'Đang tìm ảnh cảnh phim & hoạt động nhìn rõ khuôn mặt nhân vật...'
+                          ? 'Đang tìm ảnh thực tế & ảnh trong cảnh phim...'
                           : 'Chưa có ảnh thuộc nhóm này trong lượt tải hiện tại.'}
                       </p>
                       {!isLoadingClearFacePhotos && (
@@ -4178,22 +4178,20 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                           onClick={() => fetchClearFacePhotosByMode(photoFocusMode, true)}
                           className="px-3 py-1.5 rounded-md text-xs font-bold bg-amber-500 hover:bg-amber-400 text-slate-950"
                         >
-                          🔍 Tìm Ngay Ảnh Rõ Mặt Cho Nhóm Này
+                          🔍 Tìm Ngay Ảnh Thực Tế &amp; Cảnh Phim
                         </button>
                       )}
                     </div>
                   ) : (
                     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
                       {combinedPhotos.map((photo, idx) => {
-                        const cat = photo.photoCategory || 'portrait';
+                        const cat = photo.photoCategory || 'activity-scene';
                         const badgeText =
                           photo.photoCategoryLabel || getClearFaceCategoryLabel(cat);
                         const badgeClass =
                           cat === 'film-still'
                             ? 'bg-amber-500 text-slate-950'
-                            : cat === 'activity-scene'
-                            ? 'bg-sky-500 text-slate-950'
-                            : 'bg-emerald-500 text-slate-950';
+                            : 'bg-sky-500 text-slate-950';
                         const isDownloadingThis = downloadingPhotoId === photo.id;
                         return (
                           <div

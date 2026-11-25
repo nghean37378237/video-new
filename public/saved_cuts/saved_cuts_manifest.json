@@ -538,27 +538,6 @@
     "savedAt": "07:18:58"
   },
   {
-    "id": "yt-cut-1795504677346-0",
-    "targetSceneId": "ws-1",
-    "characterName": "Clint Eastwood",
-    "title": "The Outlaw Josey Wales (1976) — Cảnh Mở Đầu · [Nguồn: clint eastwood]",
-    "matchedSourceTitle": "clint eastwood",
-    "videoUrl": "/api/youtube/cut-file/yt_cut_1795504611473_0_140s_149s_34hd.mp4#cut=1&seg=140-149",
-    "sourceVideoUrl": "https://vod3.cf.dmcdn.net/sec2(zEBT-MzIRDZ5SHRw6wiXoa7B_rm98-QuteLXbMjyye6N-b1j31h-z4l9TAJv5GgUC0EOmGCQSJqNUtcy2GTtpa8seZloiX2iuj9dAsIcDqzLigU2XdXrwso-BZDlkQLeguZc9yk6VtuGk2396nd7bjT-bziNabafUNBu6jF03dc)/video/046/037/1730640_mp4_h264_aac.m3u8",
-    "thumbnailUrl": "/api/youtube/cut-file/yt_cut_1795504611473_0_140s_149s_34hd.jpg",
-    "trimStartSec": 0,
-    "trimEndSec": 9,
-    "originalStartSec": 140,
-    "originalEndSec": 149,
-    "durationSec": 9,
-    "width": 720,
-    "height": 960,
-    "frameMode": "3:4-sharp",
-    "focusX": "center",
-    "sourceLabel": "✂️ Đã cắt Chuẩn 3:4 HD từ \"clint eastwood\" (140s → 149s)",
-    "savedAt": "07:17:57"
-  },
-  {
     "id": "yt-cut-1795504477784-0",
     "targetSceneId": "ws-1",
     "characterName": "Clint Eastwood",

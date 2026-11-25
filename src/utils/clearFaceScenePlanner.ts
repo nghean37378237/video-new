@@ -3,7 +3,9 @@ import { getAspectRatioSpec } from './fullFrameHelper';
 import {
   cleanCharacterNameForSearch,
   classifySceneStoryStage,
+  isDrawingOrIllustrationPhoto,
   isGenericOrNonFacePhoto,
+  isPosedPortraitOrHeadshotPhoto,
   type StoryPhotoStageId,
   type StorySceneSummaryInput,
 } from './storyStagePhotoPlanner';
@@ -53,16 +55,16 @@ export const CLEAR_FACE_CATEGORY_META: Record<
     regTipVi: 'Khung cảnh phim rõ mặt nhân vật — lý tưởng để reg video diễn xuất tự nhiên (Grok / Kling AI).',
   },
   'activity-scene': {
-    labelVi: 'Hoạt Động & Hậu Trường Rõ Mặt',
-    shortVi: 'Hoạt Động',
-    badgeEmoji: '🎯',
-    regTipVi: 'Cảnh ngoài đời / hậu trường / phỏng vấn rõ mặt — dễ tạo chuyển động chân thực khi reg video.',
+    labelVi: 'Ảnh Thực Tế & Hậu Trường',
+    shortVi: 'Ảnh Thực Tế',
+    badgeEmoji: '📸',
+    regTipVi: 'Ảnh chụp thực tế ngoài đời / hậu trường / phỏng vấn — tạo chuyển động tự nhiên chân thực khi reg video.',
   },
   portrait: {
-    labelVi: 'Chân Dung Cận Mặt',
+    labelVi: 'Chân Dung Studio',
     shortVi: 'Chân Dung',
     badgeEmoji: '👤',
-    regTipVi: 'Chân dung cận mặt sắc nét — khóa nhận diện khuôn mặt chuẩn 100% khi reg video.',
+    regTipVi: 'Chân dung studio (đã ẩn mặc định để ưu tiên ảnh thực tế và cảnh phim).',
   },
 };
 
@@ -70,7 +72,7 @@ const FILM_STILL_SIGNAL_REGEX =
   /\b(movie|film|still|scene|cinema|starring|character|role|screenshot|screencap|screen\s*cap|episode|tv\s*series|television|western|drama|cuckoo|josey\s+wales|bromden|ten\s+bears|cast|trailer|production\s+still|publicity\s+still|in\s+the\s+movie|as\s+[A-Z][a-z]+)\b/i;
 
 const ACTIVITY_SCENE_SIGNAL_REGEX =
-  /\b(behind\s+the\s+scenes|on\s+set|filming|directing|interview|speaking|speech|talk\s+show|press\s+conference|premiere|award|oscar|academy|ceremony|festival|candid|rodeo|horse|horseback|cowboy|riding|paint|painter|painting|artist|canvas|studio\s+work|guitar|singing|concert|performing|rehearsal|training|martial\s+arts|boxing|rally|activist|event|gala|backstage|off\s+screen|working|reading|writing|playing)\b/i;
+  /\b(behind\s+the\s+scenes|on\s+set|filming|directing|interview|speaking|speech|talk\s+show|press\s+conference|premiere|award|oscar|academy|ceremony|festival|candid|rodeo|horse|horseback|cowboy|riding|studio\s+work|guitar|singing|concert|performing|rehearsal|training|martial\s+arts|boxing|rally|activist|event|gala|backstage|off\s+screen|working|reading|writing|playing|real\s+life|archival|live)\b/i;
 
 export function classifyClearFacePhotoCategory(
   title: string,
@@ -86,16 +88,18 @@ export function classifyClearFacePhotoCategory(
   if (ACTIVITY_SCENE_SIGNAL_REGEX.test(combined)) {
     return 'activity-scene';
   }
-  if (fallbackCategory) {
+  if (isPosedPortraitOrHeadshotPhoto(title, sourceUrl)) {
+    return 'portrait';
+  }
+  if (fallbackCategory && fallbackCategory !== 'portrait') {
     return fallbackCategory;
   }
   if (stage === 'peak-cinema') return 'film-still';
-  if (stage === 'personal-behind-scenes' || stage === 'breakthrough') return 'activity-scene';
-  return 'portrait';
+  return 'activity-scene';
 }
 
 export function getClearFaceCategoryLabel(category: ClearFacePhotoCategory): string {
-  const meta = CLEAR_FACE_CATEGORY_META[category] || CLEAR_FACE_CATEGORY_META.portrait;
+  const meta = CLEAR_FACE_CATEGORY_META[category] || CLEAR_FACE_CATEGORY_META['activity-scene'];
   return `${meta.badgeEmoji} ${meta.shortVi}`;
 }
 
@@ -233,8 +237,7 @@ export function buildClearFaceSceneQueries(
   };
 
   const wantFilm = mode === 'all' || mode === 'film-still';
-  const wantActivity = mode === 'all' || mode === 'activity-scene';
-  const wantPortrait = mode === 'all' || mode === 'portrait';
+  const wantActivity = mode === 'all' || mode === 'activity-scene' || mode === 'portrait';
 
   if (wantFilm) {
     if (anchors.filmOrRoleTerms.length > 0) {
@@ -317,69 +320,55 @@ export function buildClearFaceSceneQueries(
       });
     }
     addPlan({
-      query: `${cleanChar} behind the scenes`,
-      category: 'activity-scene',
-      categoryLabelVi: CLEAR_FACE_CATEGORY_META['activity-scene'].labelVi,
-      bingFaceMode: 'face',
-      allowClassicStillAspect: true,
-      allowMultiSubject: true,
-      stage: 'personal-behind-scenes',
-      stageLabelVi: '🎯 Hoạt Động Rõ Mặt',
-      priority: 9,
-    });
-    addPlan({
-      query: `${cleanChar} interview candid`,
-      category: 'activity-scene',
-      categoryLabelVi: CLEAR_FACE_CATEGORY_META['activity-scene'].labelVi,
-      bingFaceMode: 'face',
-      allowClassicStillAspect: true,
-      allowMultiSubject: false,
-      stage: 'personal-behind-scenes',
-      stageLabelVi: '🎯 Hoạt Động Rõ Mặt',
-      priority: 8,
-    });
-    if (mode === 'activity-scene') {
-      addPlan({
-        query: `${cleanChar} on set`,
+        query: `${cleanChar} behind the scenes`,
         category: 'activity-scene',
         categoryLabelVi: CLEAR_FACE_CATEGORY_META['activity-scene'].labelVi,
         bingFaceMode: 'face',
         allowClassicStillAspect: true,
         allowMultiSubject: true,
         stage: 'personal-behind-scenes',
-        stageLabelVi: '🎯 Hoạt Động Rõ Mặt',
+        stageLabelVi: '📸 Ảnh Thực Tế',
+        priority: 9,
+      });
+    addPlan({
+      query: `${cleanChar} candid real life photo`,
+      category: 'activity-scene',
+      categoryLabelVi: CLEAR_FACE_CATEGORY_META['activity-scene'].labelVi,
+      bingFaceMode: 'face',
+      allowClassicStillAspect: true,
+      allowMultiSubject: true,
+      stage: 'personal-behind-scenes',
+      stageLabelVi: '📸 Ảnh Thực Tế',
+      priority: 9,
+    });
+    addPlan({
+      query: `${cleanChar} interview on set`,
+      category: 'activity-scene',
+      categoryLabelVi: CLEAR_FACE_CATEGORY_META['activity-scene'].labelVi,
+      bingFaceMode: 'face',
+      allowClassicStillAspect: true,
+      allowMultiSubject: true,
+      stage: 'personal-behind-scenes',
+      stageLabelVi: '📸 Ảnh Thực Tế',
+      priority: 8,
+    });
+    if (mode === 'activity-scene') {
+      addPlan({
+        query: `${cleanChar}${yearSuffix} premiere event candid`,
+        category: 'activity-scene',
+        categoryLabelVi: CLEAR_FACE_CATEGORY_META['activity-scene'].labelVi,
+        bingFaceMode: 'face',
+        allowClassicStillAspect: true,
+        allowMultiSubject: true,
+        stage: 'personal-behind-scenes',
+        stageLabelVi: '📸 Ảnh Thực Tế',
         priority: 7,
       });
     }
   }
 
-  if (wantPortrait) {
-    addPlan({
-      query: `${cleanChar}${yearSuffix} portrait`,
-      category: 'portrait',
-      categoryLabelVi: CLEAR_FACE_CATEGORY_META.portrait.labelVi,
-      bingFaceMode: 'portrait',
-      allowClassicStillAspect: false,
-      allowMultiSubject: false,
-      stage: stageInfo?.stage || 'legacy-portrait',
-      stageLabelVi: '👤 Chân Dung Rõ Mặt',
-      priority: mode === 'portrait' ? 10 : 7,
-    });
-    if (mode === 'portrait') {
-      addPlan({
-        query: `${cleanChar} headshot photo`,
-        category: 'portrait',
-        categoryLabelVi: CLEAR_FACE_CATEGORY_META.portrait.labelVi,
-        bingFaceMode: 'portrait',
-        allowClassicStillAspect: false,
-        allowMultiSubject: false,
-        stage: 'legacy-portrait',
-        stageLabelVi: '👤 Chân Dung Rõ Mặt',
-        priority: 9,
-      });
-    }
-  }
-
+  // Note: Never generate posed portrait/headshot queries — keep 100% movie scenes & real-life candid photography
+  void stageInfo;
   return plans.sort((a, b) => b.priority - a.priority).slice(0, maxQueries);
 }
 
@@ -396,16 +385,22 @@ export function sortAndBalanceClearFacePhotos<T extends ClearFacePhotoItem>(
   const seen = new Set<string>();
   for (const p of photos) {
     if (!p || !p.dataUrl) continue;
+    // Strictly block drawings/paintings/illustrations and posed studio portraits/headshots
+    if (isDrawingOrIllustrationPhoto(p.title, p.sourceUrl || '')) continue;
+    if (isPosedPortraitOrHeadshotPhoto(p.title, p.sourceUrl || '')) continue;
     const key = p.dataUrl.slice(0, 140);
     if (seen.has(key)) continue;
     seen.add(key);
-    const cat =
-      p.photoCategory ||
-      classifyClearFacePhotoCategory(p.title, p.sourceUrl || '', p.stage);
+    const classified = classifyClearFacePhotoCategory(p.title, p.sourceUrl || '', p.stage);
+    const rawCat = p.photoCategory && p.photoCategory !== 'portrait' ? p.photoCategory : classified;
+    if (rawCat === 'portrait') continue;
     deduped.push({
       ...p,
-      photoCategory: cat,
-      photoCategoryLabel: p.photoCategoryLabel || getClearFaceCategoryLabel(cat),
+      photoCategory: rawCat,
+      photoCategoryLabel:
+        p.photoCategoryLabel && !/chân\s*dung/i.test(p.photoCategoryLabel)
+          ? p.photoCategoryLabel
+          : getClearFaceCategoryLabel(rawCat),
     });
   }
 
@@ -416,18 +411,16 @@ export function sortAndBalanceClearFacePhotos<T extends ClearFacePhotoItem>(
       if (cat === preferredMode) s += 35;
       else s -= 8;
     } else {
-      // In 'all' mode, gently lift film stills & activity scenes so user sees rich acting/action frames first
-      if (cat === 'film-still') s += 14;
-      else if (cat === 'activity-scene') s += 12;
-      else s += 6;
+      if (cat === 'film-still') s += 16;
+      else if (cat === 'activity-scene') s += 14;
     }
 
     const w = item.width || 720;
     const h = item.height || 960;
     const aspect = w / Math.max(1, h);
-    if (aspect >= 0.58 && aspect <= 1.15) s += 12;
-    else if (aspect > 1.15 && aspect <= 1.56) s += 7;
-    else if (aspect > 1.6) s -= 24;
+    if (aspect >= 0.62 && aspect <= 1.56) s += 12;
+    else if (aspect > 1.56 && aspect <= 1.65) s += 4;
+    else if (aspect > 1.65) s -= 24;
 
     if (Math.min(w, h) >= 480) s += 6;
     if (isGenericOrNonFacePhoto(item.title, item.sourceUrl || '')) s -= 50;
@@ -440,18 +433,21 @@ export function sortAndBalanceClearFacePhotos<T extends ClearFacePhotoItem>(
     return sorted;
   }
 
-  // Interleave film-still, activity-scene, and portrait so top rows always show rich variety
-  const buckets: Record<ClearFacePhotoCategory, TaggedItem[]> = {
+  // Interleave film-still and real-life activity-scene 50/50
+  const buckets: Record<'film-still' | 'activity-scene', TaggedItem[]> = {
     'film-still': [],
     'activity-scene': [],
-    portrait: [],
   };
   for (const item of sorted) {
-    buckets[item.photoCategory].push(item);
+    if (item.photoCategory === 'film-still') {
+      buckets['film-still'].push(item);
+    } else {
+      buckets['activity-scene'].push(item);
+    }
   }
 
   const balanced: TaggedItem[] = [];
-  const order: ClearFacePhotoCategory[] = ['film-still', 'activity-scene', 'portrait'];
+  const order: Array<'film-still' | 'activity-scene'> = ['film-still', 'activity-scene'];
   let added = true;
   while (added) {
     added = false;

@@ -5,7 +5,9 @@ import {
   classifySceneStoryStage,
   cleanCharacterNameForSearch,
   extractHistoricalPhotoYear,
+  isDrawingOrIllustrationPhoto,
   isGenericOrNonFacePhoto,
+  isPosedPortraitOrHeadshotPhoto,
   isSpamOrNonCharacterPhoto,
   matchesCharacterPhotoIdentity,
   rankAndAssignStagePhotosToScenes,
@@ -110,12 +112,16 @@ test('buildRichStagePhotoQueries produces diverse queries covering multiple life
   assert.ok(withoutScenes.some((q) => q.stage === 'early-life'));
   assert.ok(withoutScenes.some((q) => q.stage === 'peak-cinema'));
   assert.ok(withoutScenes.some((q) => q.stage === 'later-years'));
+  assert.ok(
+    withoutScenes.every((q) => !/\b(portrait|headshot)\b/i.test(q.query)),
+    `Stage queries must not request studio portraits: ${JSON.stringify(withoutScenes.map((q) => q.query))}`
+  );
 });
 
 test('rankAndAssignStagePhotosToScenes matches chronological stage photos uniquely without duplicates', () => {
   const pool: VerifiedStagePhotoCandidate[] = [
     {
-      title: 'Will Sampson young Oklahoma portrait 1954',
+      title: 'Will Sampson young Oklahoma candid archival photo 1954',
       dataUrl: 'data:image/jpeg;base64,YOUNG',
       sourceUrl: 'https://example.com/young-1954.jpg',
       width: 720,
@@ -278,40 +284,75 @@ test('isGenericOrNonFacePhoto blocks split-screen collages, then-and-now compari
   assert.equal(isGenericOrNonFacePhoto('Dolly Parton solo studio portrait closeup 1977'), false);
 });
 
-test('rankAndAssignStagePhotosToScenes strongly prefers clear solo portrait over wide generic stage photo', () => {
+test('isDrawingOrIllustrationPhoto blocks drawings, paintings, sketches, AI art, and art marketplaces while keeping real photos', () => {
+  assert.equal(isDrawingOrIllustrationPhoto('John Wayne pencil drawing sketch'), true);
+  assert.equal(isDrawingOrIllustrationPhoto('Bruce Lee oil painting on canvas fan art'), true);
+  assert.equal(isDrawingOrIllustrationPhoto('Clint Eastwood watercolor illustration caricature'), true);
+  assert.equal(isDrawingOrIllustrationPhoto('John Wayne art', 'https://deviantart.com/jw.jpg'), true);
+  assert.equal(isDrawingOrIllustrationPhoto('Bruce Lee 2001 Tajikistan stamp4'), true);
+  assert.equal(isDrawingOrIllustrationPhoto('Tranh vẽ chân dung Bruce Lee'), true);
+  assert.equal(isDrawingOrIllustrationPhoto('John Wayne in The Searchers 1956 movie scene still'), false);
+  assert.equal(isDrawingOrIllustrationPhoto('Bruce Lee behind the scenes on set candid photo 1972'), false);
+});
+
+test('isPosedPortraitOrHeadshotPhoto blocks studio portraits and headshots while keeping real candid and movie still photos', () => {
+  assert.equal(isPosedPortraitOrHeadshotPhoto('John Wayne (Chân dung gốc)'), true);
+  assert.equal(isPosedPortraitOrHeadshotPhoto('John Wayne - still portrait'), true);
+  assert.equal(
+    isPosedPortraitOrHeadshotPhoto('John Wayne', 'https://upload.wikimedia.org/wikipedia/commons/7/7b/John_Wayne_-_still_portrait.jpg'),
+    true
+  );
+  assert.equal(isPosedPortraitOrHeadshotPhoto('The Big Trail (publicity photo - Wayne & Churchill)'), true);
+  assert.equal(isPosedPortraitOrHeadshotPhoto('Ảnh chân dung Bruce Lee'), true);
+  assert.equal(isPosedPortraitOrHeadshotPhoto('Bruce Lee studio portrait headshot'), true);
+  assert.equal(isPosedPortraitOrHeadshotPhoto('Will Sampson classic portrait 1975'), true);
+  assert.equal(isPosedPortraitOrHeadshotPhoto('John Wayne movie scene still 1956'), false);
+  assert.equal(isPosedPortraitOrHeadshotPhoto('Bruce Lee behind the scenes on set candid 1972'), false);
+});
+
+test('rankAndAssignStagePhotosToScenes strongly prefers real movie still over studio portrait and drawing', () => {
   const scenes: StorySceneSummaryInput[] = [
     {
       id: 'd1',
       order: 1,
-      title: 'Giọng ca vàng Dolly Parton',
+      title: 'Cảnh phim huyền thoại của John Wayne',
       sceneType: 'image',
-      narrationText: 'Dolly Parton smiled warmly under the spotlight.',
-      archivalKeywords: 'Dolly Parton singer',
+      narrationText: 'John Wayne rode across Monument Valley in a classic Western scene.',
+      archivalKeywords: 'John Wayne western movie scene',
     },
   ];
   const pool: VerifiedStagePhotoCandidate[] = [
     {
-      title: 'Dolly Parton concert stage wide shot crowd',
-      dataUrl: 'data:image/jpeg;base64,WIDE_GENERIC',
-      sourceUrl: 'https://example.com/stage-wide.jpg',
-      width: 1600,
-      height: 900,
-      year: 1978,
+      title: 'John Wayne pencil drawing illustration fan art',
+      dataUrl: 'data:image/jpeg;base64,DRAWING',
+      sourceUrl: 'https://example.com/drawing.jpg',
+      width: 800,
+      height: 1000,
+      year: 1956,
       stage: 'peak-cinema',
     },
     {
-      title: 'Dolly Parton solo studio portrait closeup face',
-      dataUrl: 'data:image/jpeg;base64,CLEAR_PORTRAIT',
-      sourceUrl: 'https://example.com/portrait-closeup.jpg',
+      title: 'John Wayne studio portrait headshot',
+      dataUrl: 'data:image/jpeg;base64,STUDIO_PORTRAIT',
+      sourceUrl: 'https://example.com/portrait.jpg',
       width: 800,
       height: 1066,
-      year: 1978,
+      year: 1956,
+      stage: 'peak-cinema',
+    },
+    {
+      title: 'John Wayne in The Searchers western movie scene still 1956',
+      dataUrl: 'data:image/jpeg;base64,REAL_FILM_STILL',
+      sourceUrl: 'https://example.com/searchers-still-1956.jpg',
+      width: 960,
+      height: 720,
+      year: 1956,
       stage: 'peak-cinema',
     },
   ];
 
-  const res = rankAndAssignStagePhotosToScenes(scenes, pool, 'Dolly Parton');
-  assert.equal(res.assignedBySceneId['d1']?.dataUrl, 'data:image/jpeg;base64,CLEAR_PORTRAIT');
+  const res = rankAndAssignStagePhotosToScenes(scenes, pool, 'John Wayne');
+  assert.equal(res.assignedBySceneId['d1']?.dataUrl, 'data:image/jpeg;base64,REAL_FILM_STILL');
 });
 
 

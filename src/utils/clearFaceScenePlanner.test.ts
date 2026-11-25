@@ -84,21 +84,27 @@ test('buildClearFaceSceneQueries uses Bing face mode and classic still aspect fo
   const categories = new Set(mixedPlans.map((p) => p.category));
   assert.ok(categories.has('film-still'));
   assert.ok(categories.has('activity-scene'));
-  assert.ok(categories.has('portrait'));
+  assert.equal(categories.has('portrait'), false, 'Should never generate studio portrait queries');
+  assert.ok(
+    mixedPlans.every((p) => !/\b(portrait|headshot)\b/i.test(p.query)),
+    `No query should request portraits/headshots: ${JSON.stringify(mixedPlans.map((p) => p.query))}`
+  );
 });
 
-test('sortAndBalanceClearFacePhotos balances film-still, activity-scene, and portrait and respects preferred category', () => {
+test('sortAndBalanceClearFacePhotos strictly removes drawings and studio portraits, keeping only film stills and real-life candid photos', () => {
   const sample = [
+    { id: 'd1', title: 'Will Sampson pencil drawing sketch fan art', dataUrl: 'data:image/jpeg;base64,d1', width: 720, height: 960 },
+    { id: 'd2', title: 'Will Sampson oil painting by artist', dataUrl: 'data:image/jpeg;base64,d2', width: 720, height: 960 },
     { id: 'p1', title: 'Will Sampson portrait headshot', dataUrl: 'data:image/jpeg;base64,p1', width: 720, height: 960 },
-    { id: 'p2', title: 'Will Sampson studio portrait', dataUrl: 'data:image/jpeg;base64,p2', width: 720, height: 960 },
+    { id: 'p2', title: 'Will Sampson (Chân dung gốc)', dataUrl: 'data:image/jpeg;base64,p2', width: 720, height: 960 },
     { id: 'f1', title: 'Will Sampson movie scene still 1975', dataUrl: 'data:image/jpeg;base64,f1', width: 900, height: 650 },
     { id: 'a1', title: 'Will Sampson rodeo cowboy candid', dataUrl: 'data:image/jpeg;base64,a1', width: 850, height: 620 },
   ];
 
   const balanced = sortAndBalanceClearFacePhotos(sample, 'all');
+  assert.equal(balanced.length, 2);
   assert.equal(balanced[0].photoCategory, 'film-still');
   assert.equal(balanced[1].photoCategory, 'activity-scene');
-  assert.equal(balanced[2].photoCategory, 'portrait');
 
   const activityFirst = sortAndBalanceClearFacePhotos(sample, 'activity-scene');
   assert.equal(activityFirst[0].photoCategory, 'activity-scene');

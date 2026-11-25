@@ -419,14 +419,12 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
           setActivePhotoCatFilter(mode);
           const modeLabel =
             mode === 'film-still'
-              ? 'Cảnh Phim Rõ Mặt'
+              ? 'Ảnh Trong Cảnh Phim'
               : mode === 'activity-scene'
-              ? 'Hoạt Động & Hậu Trường Rõ Mặt'
-              : mode === 'portrait'
-              ? 'Chân Dung Cận Mặt'
-              : 'Cảnh Phim & Hoạt Động Rõ Mặt';
+              ? 'Ảnh Thực Tế & Hậu Trường'
+              : 'Ảnh Thực Tế & Cảnh Phim';
           setClearFaceStatusNote(
-            `✅ Đã bổ sung ${normalized.length} ảnh ${modeLabel} — bấm vào ảnh bất kỳ để gắn & tạo Prompt Reg Video rõ mặt!`
+            `✅ Đã bổ sung ${normalized.length} ${modeLabel} (đã loại ảnh vẽ & chân dung) — bấm vào ảnh để gắn & tạo Prompt Reg Video!`
           );
         } else {
           setClearFaceStatusNote(
@@ -1135,18 +1133,17 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
                 <div className="flex items-center justify-between gap-1.5">
                   <span className="text-[11px] font-bold text-sky-300 flex items-center gap-1">
                     <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    <span>🎬 Bổ Sung Ảnh Cảnh Phim &amp; Hoạt Động Rõ Mặt (Reg Video):</span>
+                    <span>🎬 Bổ Sung Ảnh Thực Tế &amp; Cảnh Phim (Không Ảnh Vẽ / Chân Dung):</span>
                   </span>
                 </div>
                 <p className="text-[10px] text-slate-400 leading-snug">
-                  Lấy thêm khung hình diễn viên trong cảnh phim &amp; hoạt động ngoài đời nhìn rõ khuôn mặt để tải 3:4 HD + copy prompt reg video chuẩn nhân vật.
+                  Chỉ lấy ảnh chụp thực tế ngoài đời / hậu trường và ảnh cắt trong cảnh phim — tự động loại ảnh vẽ, tranh minh họa &amp; ảnh chân dung studio.
                 </p>
-                <div className="grid grid-cols-3 gap-1.5">
+                <div className="grid grid-cols-2 gap-1.5">
                   {(
                     [
-                      { id: 'film-still' as const, label: '🎬 Cảnh Phim', color: 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border-amber-500/40' },
-                      { id: 'activity-scene' as const, label: '🎯 Hoạt Động', color: 'bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border-sky-500/40' },
-                      { id: 'portrait' as const, label: '👤 Chân Dung', color: 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border-emerald-500/40' },
+                      { id: 'film-still' as const, label: '🎬 Ảnh Trong Cảnh Phim', color: 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border-amber-500/40' },
+                      { id: 'activity-scene' as const, label: '📸 Ảnh Thực Tế / Hậu Trường', color: 'bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border-sky-500/40' },
                     ]
                   ).map((btn) => {
                     const isLoadingThis = clearFaceFetchMode === btn.id;
@@ -1189,15 +1186,14 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
                     <div className="space-y-1.5 pt-1 border-t border-slate-800">
                       <div className="flex flex-wrap items-center justify-between gap-1">
                         <span className="text-[10px] font-semibold text-amber-300">
-                          Chọn ảnh rõ mặt để gắn &amp; tạo Prompt Reg Video ({visibleOpts.length}/{allSceneOpts.length}):
+                          Chọn ảnh thực tế / cảnh phim để gắn ({visibleOpts.length}/{allSceneOpts.length}):
                         </span>
                         <div className="flex items-center gap-1">
                           {(
                             [
                               { id: 'all' as const, label: 'Tất cả' },
-                              { id: 'film-still' as const, label: '🎬 Phim' },
-                              { id: 'activity-scene' as const, label: '🎯 Hoạt động' },
-                              { id: 'portrait' as const, label: '👤 Chân dung' },
+                              { id: 'film-still' as const, label: '🎬 Cảnh Phim' },
+                              { id: 'activity-scene' as const, label: '📸 Thực Tế' },
                             ]
                           ).map((tab) => (
                             <button
