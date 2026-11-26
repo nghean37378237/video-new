@@ -1,3 +1,5 @@
+import { deduplicatePhotoPool } from './photoQualityInspector';
+
 export type StoryPhotoStageId =
   | 'early-life'
   | 'breakthrough'
@@ -47,6 +49,8 @@ export interface VerifiedStagePhotoCandidate {
   stageLabel?: string;
   photoCategory?: 'film-still' | 'activity-scene' | 'portrait';
   photoCategoryLabel?: string;
+  visualHash?: string;
+  centerVisualHash?: string;
 }
 
 export const STORY_STAGE_META: Record<
@@ -84,13 +88,13 @@ export const STORY_STAGE_META: Record<
     chronologicalOrder: 2,
   },
   'peak-cinema': {
-    labelVi: 'Đỉnh Cao Điện Ảnh & Cảnh Phim',
-    shortVi: 'Cảnh phim',
+    labelVi: 'Đỉnh Cao Điện Ảnh & Biểu Diễn',
+    shortVi: 'Phim & Diễn',
     defaultQueryModifiers: [
       'movie scene still',
+      'live performance on stage closeup',
       'film still actor scene',
-      'cinema still screenshot',
-      'classic movie scene',
+      'classic movie scene closeup',
     ],
     allowMultiSubject: true,
     chronologicalOrder: 3,
@@ -101,7 +105,7 @@ export const STORY_STAGE_META: Record<
     defaultQueryModifiers: [
       'behind the scenes on set candid',
       'interview candid real life photo',
-      'off screen candid photo',
+      'tv show appearance candid',
       'premiere event candid',
     ],
     allowMultiSubject: true,
@@ -124,8 +128,8 @@ export const STORY_STAGE_META: Record<
     shortVi: 'Thực tế & Phim',
     defaultQueryModifiers: [
       'movie scene still',
+      'live concert performance stage',
       'behind the scenes candid photo',
-      'archival real life photograph',
     ],
     allowMultiSubject: true,
     chronologicalOrder: 6,
@@ -304,7 +308,7 @@ export function isPosedPortraitOrHeadshotPhoto(
 }
 
 const GENERIC_OR_NON_FACE_PHOTO_REGEX =
-  /\b(before[\s_-]?and[\s_-]?after|then[\s_-]?and[\s_-]?now|then[\s_-]?vs[\s_-]?now|side[\s_-]?by[\s_-]?side|split[\s_-]?screen|splitscreen|collage|montage|diptych|triptych|comparison|compared|transformation|plastic[\s_-]?surgery|unrecognizable|how\s+[a-z\s]{1,24}changed|through[\s_-]?the[\s_-]?years|over[\s_-]?the[\s_-]?years|years[\s_-]?later|lookalike|impersonator|wax[\s_-]?figure|tribute[\s_-]?band|cosplay|back[\s_-]?view|from[\s_-]?behind|rear[\s_-]?view|back[\s_-]?of[\s_-]?head|silhouette|shadow[\s_-]?only|wide[\s_-]?shot|long[\s_-]?shot|full[\s_-]?stage|stage[\s_-]?wide|concert[\s_-]?crowd|packed[\s_-]?arena|audience[\s_-]?view|crowd[\s_-]?shot|guitar[\s_-]?closeup|microphone[\s_-]?stand|hands[\s_-]?only|outfit[\s_-]?detail|dress[\s_-]?detail|red[\s_-]?carpet[\s_-]?group|group[\s_-]?photo|ensemble[\s_-]?cast|full[\s_-]?cast|band[\s_-]?members|with[\s_-]?fans|fan[\s_-]?selfie)\b/i;
+  /\b(before[\s_-]?and[\s_-]?after|then[\s_-]?and[\s_-]?now|then[\s_-]?vs[\s_-]?now|side[\s_-]?by[\s_-]?side|split[\s_-]?screen|splitscreen|collage|montage|diptych|triptych|comparison|compared|transformation|plastic[\s_-]?surgery|unrecognizable|how\s+[a-z\s]{1,24}changed|through[\s_-]?the[\s_-]?years|over[\s_-]?the[\s_-]?years|years[\s_-]?later|lookalike|impersonator|wax[\s_-]?figure|wax[\s_-]?museum|heritage[\s_-]?museum|museum[\s_-]?exhibit|avenue[\s_-]?of[\s_-]?stars|statue|memorial[\s_-]?plaque|lot[\s_-]?detail|auction[\s_-]?lot|stage[\s_-]?used|memorabilia|action[\s_-]?figure|figurine|collectible|tribute[\s_-]?band|cosplay|back[\s_-]?view|from[\s_-]?behind|rear[\s_-]?view|back[\s_-]?of[\s_-]?head|silhouette|shadow[\s_-]?only|wide[\s_-]?shot|long[\s_-]?shot|full[\s_-]?stage|stage[\s_-]?wide|concert[\s_-]?crowd|packed[\s_-]?arena|audience[\s_-]?view|crowd[\s_-]?shot|guitar[\s_-]?closeup|microphone[\s_-]?stand|hands[\s_-]?only|outfit[\s_-]?detail|dress[\s_-]?detail|red[\s_-]?carpet[\s_-]?group|group[\s_-]?photo|ensemble[\s_-]?cast|full[\s_-]?cast|band[\s_-]?members|with[\s_-]?fans|fan[\s_-]?selfie)\b/i;
 
 export function isGenericOrNonFacePhoto(
   title: string,
@@ -312,7 +316,8 @@ export function isGenericOrNonFacePhoto(
   pageUrl = ''
 ): boolean {
   const combined = `${title || ''} ${imageUrl || ''} ${pageUrl || ''}`;
-  return GENERIC_OR_NON_FACE_PHOTO_REGEX.test(combined);
+  const normalized = normalizeMediaMetadataForRegex(title, imageUrl, pageUrl);
+  return GENERIC_OR_NON_FACE_PHOTO_REGEX.test(combined) || GENERIC_OR_NON_FACE_PHOTO_REGEX.test(normalized);
 }
 
 export function isSpamOrNonCharacterPhoto(
@@ -569,15 +574,59 @@ export function buildRichStagePhotoQueries(
     (s) => s && s.sceneType !== 'quote' && s.sceneType !== 'outro'
   );
 
-  // 1. Always lead with real movie stills & authentic real-life candid archival photography (NEVER posed studio portraits or drawings)
-  addPlan({
-    query: `${cleanChar} movie scene still`,
-    stage: 'peak-cinema',
-    stageLabelVi: STORY_STAGE_META['peak-cinema'].labelVi,
-    allowMultiSubject: true,
-    targetYear: null,
-    priority: 10,
-  });
+  // Detect singer / musician / stage performer context so we prioritize clear-face concert & stage singing frames alongside movie stills
+  const allStoryText = `${rawCharacterName} ${visualScenes
+    .map((s) => `${s.title || ''} ${s.narrationText || ''} ${s.archivalKeywords || ''}`)
+    .join(' ')}`;
+  const isLikelyPerformerOrSinger =
+    /\b(singer|singing|song|songs|concert|concerts|guitar|piano|album|musician|band|vocalist|tour|microphone|stage|grammy|country\s+music|rock\s+and\s+roll|pop\s+star|elvis|presley|dolly\s+parton|sinatra|johnny\s+cash|whitney\s+houston|michael\s+jackson|freddie\s+mercury|bob\s+dylan|celine\s+dion|adele|taylor\s+swift|madonna|beyonce|cher|bowie|lennon|streisand|willie\s+nelson|hank\s+williams|patsy\s+cline|loretta\s+lynn|ca\s*sĩ|biểu\s*diễn|sân\s*khấu|âm\s*nhạc|bài\s*hát)\b/i.test(
+      allStoryText
+    );
+
+  // 1. Always lead with real movie stills & live stage/concert performance scenes (NEVER posed studio portraits or drawings)
+  if (isLikelyPerformerOrSinger) {
+    addPlan({
+      query: `${cleanChar} live concert singing on stage`,
+      stage: 'peak-cinema',
+      stageLabelVi: STORY_STAGE_META['peak-cinema'].labelVi,
+      allowMultiSubject: true,
+      targetYear: null,
+      priority: 10,
+    });
+    addPlan({
+      query: `${cleanChar} performing live microphone closeup`,
+      stage: 'peak-cinema',
+      stageLabelVi: STORY_STAGE_META['peak-cinema'].labelVi,
+      allowMultiSubject: true,
+      targetYear: null,
+      priority: 10,
+    });
+    addPlan({
+      query: `${cleanChar} movie scene still`,
+      stage: 'peak-cinema',
+      stageLabelVi: STORY_STAGE_META['peak-cinema'].labelVi,
+      allowMultiSubject: true,
+      targetYear: null,
+      priority: 9,
+    });
+  } else {
+    addPlan({
+      query: `${cleanChar} movie scene still`,
+      stage: 'peak-cinema',
+      stageLabelVi: STORY_STAGE_META['peak-cinema'].labelVi,
+      allowMultiSubject: true,
+      targetYear: null,
+      priority: 10,
+    });
+    addPlan({
+      query: `${cleanChar} film scene closeup acting`,
+      stage: 'peak-cinema',
+      stageLabelVi: STORY_STAGE_META['peak-cinema'].labelVi,
+      allowMultiSubject: true,
+      targetYear: null,
+      priority: 9,
+    });
+  }
 
   if (options.secondaryPerson) {
     addPlan({
@@ -614,7 +663,7 @@ export function buildRichStagePhotoQueries(
     }
   }
 
-  // 3. Ensure every core documentary life stage is covered by REAL FILM STILLS and REAL-LIFE CANDID PHOTOS!
+  // 3. Ensure every core documentary life stage is covered by DIVERSE FILM STILLS, LIVE PERFORMANCES, TV APPEARANCES, AND REAL-LIFE CANDID PHOTOS!
   const coreStageFallbacks: StageSearchQueryPlan[] = [
     {
       query: `${cleanChar} behind the scenes on set candid`,
@@ -625,7 +674,9 @@ export function buildRichStagePhotoQueries(
       priority: 9,
     },
     {
-      query: `${cleanChar} film scene screenshot`,
+      query: isLikelyPerformerOrSinger
+        ? `${cleanChar} tv show performance live stage`
+        : `${cleanChar} classic cinema still scene`,
       stage: 'peak-cinema',
       stageLabelVi: STORY_STAGE_META['peak-cinema'].labelVi,
       allowMultiSubject: true,
@@ -641,17 +692,27 @@ export function buildRichStagePhotoQueries(
       priority: 8,
     },
     {
-      query: `${cleanChar} interview candid real life photo`,
+      query: `${cleanChar} interview talk show candid`,
       stage: 'personal-behind-scenes',
       stageLabelVi: STORY_STAGE_META['personal-behind-scenes'].labelVi,
+      allowMultiSubject: true,
+      targetYear: null,
+      priority: 8,
+    },
+    {
+      query: isLikelyPerformerOrSinger
+        ? `${cleanChar} early concert stage performance`
+        : `${cleanChar} early movie scene still`,
+      stage: 'breakthrough',
+      stageLabelVi: STORY_STAGE_META.breakthrough.labelVi,
       allowMultiSubject: true,
       targetYear: null,
       priority: 7,
     },
     {
-      query: `${cleanChar} early movie scene still`,
-      stage: 'breakthrough',
-      stageLabelVi: STORY_STAGE_META.breakthrough.labelVi,
+      query: `${cleanChar} award ceremony premiere candid`,
+      stage: 'later-years',
+      stageLabelVi: STORY_STAGE_META['later-years'].labelVi,
       allowMultiSubject: true,
       targetYear: null,
       priority: 7,
@@ -742,17 +803,10 @@ export function rankAndAssignStagePhotosToScenes(
   characterName = '',
   alreadyAssignedSceneIds: Set<string> = new Set()
 ): ScenePhotoAssignmentResult {
-  // 1. Deduplicate pool by dataUrl / sourceUrl
-  const uniquePool: VerifiedStagePhotoCandidate[] = [];
-  const seenKeys = new Set<string>();
-  for (const item of rawPool) {
-    if (!item || !item.dataUrl) continue;
-    const key = item.sourceUrl || item.dataUrl.slice(0, 120);
-    if (seenKeys.has(key) || seenKeys.has(item.dataUrl.slice(0, 120))) continue;
-    seenKeys.add(key);
-    seenKeys.add(item.dataUrl.slice(0, 120));
-    uniquePool.push({ ...item });
-  }
+  // 1. Multi-layer deduplication (exact dataUrl, canonical Wikimedia/Pinterest URL, cropped title stem, AND perceptual dHash)
+  const uniquePool: VerifiedStagePhotoCandidate[] = deduplicatePhotoPool(
+    rawPool.filter((item) => Boolean(item && item.dataUrl)).map((item) => ({ ...item }))
+  );
 
   const years = uniquePool
     .map((p) => p.year)
@@ -844,11 +898,11 @@ export function rankAndAssignStagePhotosToScenes(
     }
     score += Math.min(30, overlapHits * 8);
 
-    // Favor authentic real-life candid & movie still framing (classic 4:3, 3:2, square, or vertical) while avoiding ultra-wide 2:1 banners
+    // Favor authentic real-life candid, live performance & 4:3 / 3:2 / 16:9 movie still framing while avoiding ultra-wide 2:1 banners
     const aspect = (photo.width || 720) / Math.max(1, photo.height || 960);
-    if (aspect >= 0.62 && aspect <= 1.56) score += 14;
-    else if (aspect > 1.56 && aspect <= 1.65) score += 4;
-    else if (aspect > 1.65) score -= 24;
+    if (aspect >= 0.62 && aspect <= 1.82) score += 14;
+    else if (aspect > 1.82 && aspect <= 1.88) score += 4;
+    else if (aspect > 1.88) score -= 24;
 
     const metaText = `${photo.title || ''} ${photo.sourceUrl || ''}`;
     if (REAL_SCENE_OR_CANDID_SIGNAL_REGEX.test(metaText)) {
@@ -872,7 +926,8 @@ export function rankAndAssignStagePhotosToScenes(
 
   const assignedBySceneId: Record<string, VerifiedStagePhotoCandidate> = {};
   const referenceBySceneId: Record<string, VerifiedStagePhotoCandidate> = {};
-  const usedPhotoDataUrls = new Set<string>();
+  const usageCountByDataUrl = new Map<string, number>();
+  let lastPickedDataUrl = '';
 
   const imageScenes = visualScenes.filter(
     (sc) => !alreadyAssignedSceneIds.has(sc.id) && sc.sceneType === 'image'
@@ -890,8 +945,26 @@ export function rankAndAssignStagePhotosToScenes(
     sceneIdx: number,
     allowReuseFallback: boolean
   ): VerifiedStagePhotoCandidate | null => {
-    const unused = annotatedPool.filter((p) => !usedPhotoDataUrls.has(p.dataUrl));
-    const candidates = unused.length > 0 ? unused : allowReuseFallback ? annotatedPool : [];
+    if (annotatedPool.length === 0) return null;
+    const unused = annotatedPool.filter((p) => (usageCountByDataUrl.get(p.dataUrl) || 0) === 0);
+
+    let candidates: VerifiedStagePhotoCandidate[];
+    if (unused.length > 0) {
+      candidates = unused;
+    } else if (allowReuseFallback) {
+      // Strictly pick from the LEAST-USED photos and NEVER repeat the immediately preceding scene's photo
+      let minUse = Infinity;
+      for (const p of annotatedPool) {
+        const u = usageCountByDataUrl.get(p.dataUrl) || 0;
+        if (u < minUse) minUse = u;
+      }
+      const leastUsed = annotatedPool.filter((p) => (usageCountByDataUrl.get(p.dataUrl) || 0) === minUse);
+      const nonAdjacent = leastUsed.filter((p) => p.dataUrl !== lastPickedDataUrl);
+      candidates = nonAdjacent.length > 0 ? nonAdjacent : leastUsed;
+    } else {
+      candidates = [];
+    }
+
     if (candidates.length === 0) return null;
 
     let best = candidates[0];
@@ -910,7 +983,8 @@ export function rankAndAssignStagePhotosToScenes(
     const sceneIdx = visualScenes.findIndex((v) => v.id === sc.id);
     const best = pickBestForScene(sc, sceneIdx, true);
     if (best) {
-      usedPhotoDataUrls.add(best.dataUrl);
+      usageCountByDataUrl.set(best.dataUrl, (usageCountByDataUrl.get(best.dataUrl) || 0) + 1);
+      lastPickedDataUrl = best.dataUrl;
       assignedBySceneId[sc.id] = best;
       referenceBySceneId[sc.id] = best;
     }
@@ -922,7 +996,8 @@ export function rankAndAssignStagePhotosToScenes(
     const sceneIdx = visualScenes.findIndex((v) => v.id === sc.id);
     const best = pickBestForScene(sc, sceneIdx, true);
     if (best) {
-      usedPhotoDataUrls.add(best.dataUrl);
+      usageCountByDataUrl.set(best.dataUrl, (usageCountByDataUrl.get(best.dataUrl) || 0) + 1);
+      lastPickedDataUrl = best.dataUrl;
       referenceBySceneId[sc.id] = best;
     }
   }

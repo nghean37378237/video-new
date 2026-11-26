@@ -24,8 +24,14 @@ import {
 } from "./src/utils/storyStagePhotoPlanner.js";
 import {
   analyzeRawRgbForSplitOrBadFraming,
+  arePerceptuallyDuplicateFingerprints,
+  canonicalizePhotoIdentityUrl,
+  canonicalizePhotoTitleStem,
+  computeVisualFingerprintFromRgb,
+  deduplicatePhotoPool,
   evaluateCandidateAspectForClearFace,
   readImageDimensionsFromBuffer,
+  type PhotoVisualFingerprint,
 } from "./src/utils/photoQualityInspector.js";
 import {
   extractRawArchivalVideoUrl,
@@ -2649,14 +2655,24 @@ For every scene, ensure smooth chronological transitions from one scene to the n
 
   async function detectCollageOrCompositeImage(
     buf: Buffer
-  ): Promise<{ isCollage: boolean; reason?: string }> {
+  ): Promise<{
+    isCollage: boolean;
+    reason?: string;
+    visualHash?: string;
+    centerVisualHash?: string;
+  }> {
     const hasFfmpeg = await checkFfmpegAvailable();
     if (!hasFfmpeg) {
       return { isCollage: false };
     }
     return new Promise((resolve) => {
       let settled = false;
-      const done = (resVal: { isCollage: boolean; reason?: string }) => {
+      const done = (resVal: {
+        isCollage: boolean;
+        reason?: string;
+        visualHash?: string;
+        centerVisualHash?: string;
+      }) => {
         if (settled) return;
         settled = true;
         resolve(resVal);
@@ -2696,13 +2712,20 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           const raw = Buffer.concat(chunks);
           if (raw.length < W * H * 3) return done({ isCollage: false });
           const analysis = analyzeRawRgbForSplitOrBadFraming(raw, W, H);
+          const fp = computeVisualFingerprintFromRgb(raw, W, H);
           if (analysis.isSplitCollage) {
             return done({
               isCollage: true,
               reason: analysis.reason,
+              visualHash: fp?.dHash,
+              centerVisualHash: fp?.centerDHash,
             });
           }
-          done({ isCollage: false });
+          done({
+            isCollage: false,
+            visualHash: fp?.dHash,
+            centerVisualHash: fp?.centerDHash,
+          });
         });
         p.stdin.on("error", () => {});
         p.stdin.end(buf);
@@ -2720,7 +2743,13 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       enforceClearFaceAspect?: boolean;
       allowClassicWideStill?: boolean;
     } = {}
-  ): Promise<{ dataUrl: string; width: number | null; height: number | null } | null> {
+  ): Promise<{
+    dataUrl: string;
+    width: number | null;
+    height: number | null;
+    visualHash?: string;
+    centerVisualHash?: string;
+  } | null> {
     const rejectCollagePixels = options.rejectCollagePixels ?? true;
     const enforceClearFaceAspect = options.enforceClearFaceAspect ?? true;
     const urlsToTry = [primaryUrl, fallbackThumbUrl].filter(Boolean) as string[];
@@ -2764,17 +2793,23 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 }
               }
 
+              let visualHash: string | undefined;
+              let centerVisualHash: string | undefined;
               if (rejectCollagePixels) {
                 const check = await detectCollageOrCompositeImage(buf);
                 if (check.isCollage) {
                   return null;
                 }
+                visualHash = check.visualHash;
+                centerVisualHash = check.centerVisualHash;
               }
 
               return {
                 dataUrl: `data:${cType};base64,${buf.toString("base64")}`,
                 width: realDims?.width ?? null,
                 height: realDims?.height ?? null,
+                visualHash,
+                centerVisualHash,
               };
             }
           }
@@ -2988,14 +3023,21 @@ For every scene, ensure smooth chronological transitions from one scene to the n
 
   async function runBingImageSearchCached(
     query: string,
-    options: { facePortrait?: boolean; faceMode?: "face" | "portrait" | "none"; tallAspect?: boolean } = {}
+    options: {
+      facePortrait?: boolean;
+      faceMode?: "face" | "portrait" | "none";
+      tallAspect?: boolean;
+      pageOffset?: number;
+    } = {}
   ): Promise<
     Array<{ title: string; imageUrl: string; thumbUrl: string; pageUrl: string; width: number; height: number }>
   > {
     const resolvedFaceMode: "face" | "portrait" | "none" =
       options.faceMode ?? (options.facePortrait === false ? "none" : "face");
     const useTallAspect = Boolean(options.tallAspect);
-    const cacheKey = `${query.toLowerCase().trim()}|fm=${resolvedFaceMode}|tall=${useTallAspect ? 1 : 0}|realonly=1`;
+    const pageOffset = Math.max(0, Math.min(4, Math.floor(Number(options.pageOffset) || 0)));
+    const firstIndex = 1 + pageOffset * 35;
+    const cacheKey = `${query.toLowerCase().trim()}|fm=${resolvedFaceMode}|tall=${useTallAspect ? 1 : 0}|p=${pageOffset}|v2=realdiverse`;
     if (!query.trim()) return [];
     if (bingImageCache.has(cacheKey)) {
       return bingImageCache.get(cacheKey)!;
@@ -3003,7 +3045,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     try {
       const qftParts: string[] = [];
       if (resolvedFaceMode === "portrait" || resolvedFaceMode === "face") {
-        // Always use face-face (never face-portrait) so Bing returns real movie stills & candid real-life photos instead of posed studio portraits
+        // Always use face-face (never face-portrait) so Bing returns real movie stills, live stage performances & candid photos
         qftParts.push("+filterui:face-face");
       }
       // Strictly real photographs only (excludes drawings, paintings, clipart, line art)
@@ -3011,20 +3053,20 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       if (useTallAspect) qftParts.push("+filterui:aspect-tall");
       const qftParam = qftParts.length > 0 ? `&qft=${encodeURIComponent(qftParts.join(""))}` : "";
 
-      const stockExclusions =
-        "-site:gettyimages.com -site:alamy.com -site:shutterstock.com -site:fineartamerica.com -site:deviantart.com -site:artstation.com -site:redbubble.com -drawing -painting -illustration -sketch -cartoon -portrait -headshot";
-      const fullQuery = `${query} ${stockExclusions}`.trim();
+      // Keep Bing query crisp (<= 3 negative terms) because >8 negative operators causes Bing to return 0-1 cards!
+      // All watermarked stock hosts, art marketplaces, drawings & studio portraits are filtered strictly in JS below.
+      const fullQuery = `${query} -getty -alamy -drawing`.trim();
 
       const url = `https://www.bing.com/images/search?q=${encodeURIComponent(
         fullQuery
-      )}${qftParam}&form=HDRSC2&first=1&tsc=ImageBasicHover`;
+      )}${qftParam}&form=HDRSC2&first=${firstIndex}&tsc=ImageBasicHover`;
       const res = await fetch(url, {
         headers: {
           "User-Agent": BROWSER_USER_AGENT,
           "Accept-Language": "en-US,en;q=0.9",
           Accept: "text/html,application/xhtml+xml",
         },
-        signal: AbortSignal.timeout(3200),
+        signal: AbortSignal.timeout(3400),
       });
       if (!res.ok) return [];
       const html = await res.text();
@@ -3039,7 +3081,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       const seen = new Set<string>();
       const attrRegex = /m="(\{[^"]*?&quot;murl&quot;[^"]*?\})"/g;
       let match: RegExpExecArray | null;
-      while ((match = attrRegex.exec(html)) !== null && out.length < 36) {
+      while ((match = attrRegex.exec(html)) !== null && out.length < 40) {
         try {
           const decoded = match[1]
             .replace(/&quot;/g, '"')
@@ -3073,7 +3115,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     }
   }
 
-  // Helper: Search Verified Rich Character Photo Sources (IMDb Person CDN, TVMaze, Wikipedia media-list, Wikimedia Commons Search + Category, Bing Face-Portrait Images, Openverse, and rate-guarded DuckDuckGo)
+  // Helper: Search Verified Rich Character Photo Sources (Wikipedia media-list, Wikimedia Commons Search + Category, Bing Real Photos, Openverse, and rate-guarded DuckDuckGo)
   async function searchRealArchivalPhotos(
     rawQuery: string,
     limit: number,
@@ -3090,6 +3132,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       allowClassicStillAspect?: boolean;
       photoCategory?: ClearFacePhotoCategory;
       photoCategoryLabel?: string;
+      pageOffset?: number;
+      seenFingerprints?: PhotoVisualFingerprint[];
     }
   ): Promise<VerifiedStagePhotoCandidate[]> {
     const cleanQuery = rawQuery
@@ -3104,11 +3148,13 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     const subjectAnchor = (requiredSubjectName || cleanQuery).trim();
     const subjectTokens = extractSubjectIdentityTokens(subjectAnchor);
     const subjectFullPhrase = subjectTokens.slice(0, 3).join(" ");
-    // Always prioritize real-life scenes & movie stills (multi-subject and classic 4:3/3:2 stills allowed; never forced into studio portrait crops)
+    // Always prioritize real-life scenes, live stage performances & movie stills (allow 4:3, 3:2, and 16:9 HD stills)
     const allowMultiSubject = true;
     const bingFaceMode: "face" | "portrait" = "face";
     const allowClassicStillAspect = options?.allowClassicStillAspect ?? true;
-    const maxCandidateAspect = allowClassicStillAspect ? 1.62 : 1.5;
+    const maxCandidateAspect = allowClassicStillAspect ? 1.85 : 1.5;
+    const pageOffset = Math.max(0, Math.floor(Number(options?.pageOffset) || 0));
+    const sharedFingerprints = options?.seenFingerprints || [];
     const stageTag = options?.stage;
     const stageLabelTag =
       options?.stageLabel || (stageTag ? STORY_STAGE_META[stageTag]?.labelVi : undefined);
@@ -3149,20 +3195,43 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     const bannedTitleWords =
       /\b(poster|posters|affiche|plakat|locandina|cartel|lobby_card|lobby\s+card|title_card|title\s+card|intertitle|one_sheet|one\s+sheet|cover|magazine|newspaper|clipping|article|headline|pressbook|advertisement|print_ad|billboard|flyer|brochure|pamphlet|book|paperback|hardcover|novel|comic|program|playbill|sheet_music|sheet\s+music|album|sleeve|soundtrack|dvd|vhs|blu-ray|bluray|laserdisc|box_art|quote|quotes|meme|caption|captioned|subtitled|watermark|watermarked|inscribed|inscription|autograph|autographed|signed|signature|handwriting|text|typography|banner|sign|plaque|grave|gravestone|headstone|tombstone|tomb|memorial|obituary|cemetery|birthplace|childhood_home|residence|mansion|trading_card|trading\s+card|postcard|ticket|infographic|timeline|collage|montage|grid|composite|split|before\s+and\s+after|then\s+and\s+now|evolution|transformation|happy\s*birthday|birthday\s*card|wishes|greeting|logo|icon|map|flag|coat_of_arms|diagram|chart|stamp|statue|sculpture|wax|caricature|cartoon|drawing|drawings|drawn|sketch|sketches|illustration|illustrated|painting|paintings|watercolor|acrylic|charcoal|pencil|fanart|fan\s+art|artwork|vector|svg|lego|building|house|hotel|exterior|airport|courthouse|water\s*tower|certificate|document|letter|manuscript|page|script|screenplay|contract|census|draft_card|walk_of_fame|star_on|t-shirt|hoodie|mug|mugshot|headshot|headshots|studio\s+portrait|publicity\s+portrait|ebay|etsy|transparent\s+png|cutout|sticker|clipart|png)\b/i;
 
+    // Keep all watermarked stock & art marketplaces strictly blocked; allow unwatermarked i.pinimg.com vintage movie stills & live concert photos (checked by drawing/portrait/collage/dHash filters)
     const watermarkedStockDomains =
-      /\b(alamy\.com|shutterstock\.com|dreamstime\.com|depositphotos\.com|123rf\.com|istockphoto\.com|vecteezy\.com|gettyimages\.com|impawards\.com|moviepostershop\.com|allposters\.com|cinematerial\.com|amazon\.com|goodreads\.com|abebooks\.com|ebay\.com|etsy\.com|pinterest\.com|quotefancy\.com|azquotes\.com|brainyquote\.com|izquotes\.com|redbubble\.com|teepublic\.com|zazzle\.com|fineartamerica\.com|pixels\.com|saatchiart\.com|displate\.com|society6\.com|inprnt\.com|artpal\.com|artfinder\.com|mutualart\.com|behance\.net|dribbble\.com|pixiv\.net|newspapers\.com|worthpoint\.com|heritageauctions\.com|ha\.com|rrauction\.com|stickpng\.com|pngwing\.com|pngtree\.com|cleanpng\.com|pngitem\.com|klipartz\.com|kindpng\.com|nicepng\.com|seekpng\.com|favpng\.com|ytimg\.com|boredpanda\.com|brightside\.me|nickiswift\.com|looper\.com|thethings\.com|freepik\.com|craiyon\.com|seaart\.ai|lexica\.art|civitai\.com|deviantart\.com|artstation\.com|lookaside\.fbsbx\.com)\b/i;
+      /\b(alamy\.com|shutterstock\.com|dreamstime\.com|depositphotos\.com|123rf\.com|istockphoto\.com|vecteezy\.com|gettyimages\.com|impawards\.com|moviepostershop\.com|allposters\.com|cinematerial\.com|amazon\.com|goodreads\.com|abebooks\.com|ebay\.com|etsy\.com|quotefancy\.com|azquotes\.com|brainyquote\.com|izquotes\.com|redbubble\.com|teepublic\.com|zazzle\.com|fineartamerica\.com|pixels\.com|saatchiart\.com|displate\.com|society6\.com|inprnt\.com|artpal\.com|artfinder\.com|mutualart\.com|behance\.net|dribbble\.com|pixiv\.net|newspapers\.com|worthpoint\.com|heritageauctions\.com|ha\.com|rrauction\.com|stickpng\.com|pngwing\.com|pngtree\.com|cleanpng\.com|pngitem\.com|klipartz\.com|kindpng\.com|nicepng\.com|seekpng\.com|favpng\.com|ytimg\.com|boredpanda\.com|brightside\.me|nickiswift\.com|looper\.com|thethings\.com|freepik\.com|craiyon\.com|seaart\.ai|lexica\.art|civitai\.com|deviantart\.com|artstation\.com|lookaside\.fbsbx\.com)\b/i;
+
+    const registerCandidateIfUnique = (item: (typeof candidates)[number]): boolean => {
+      const canonUrl = canonicalizePhotoIdentityUrl(item.thumbUrl);
+      const fallbackCanonUrl = item.fallbackThumbUrl
+        ? canonicalizePhotoIdentityUrl(item.fallbackThumbUrl)
+        : "";
+      const titleStem = canonicalizePhotoTitleStem(item.title);
+      if (
+        usedSourceUrls.has(item.thumbUrl) ||
+        (canonUrl && usedSourceUrls.has(canonUrl)) ||
+        (fallbackCanonUrl && usedSourceUrls.has(fallbackCanonUrl)) ||
+        (titleStem.length >= 16 && usedTitleKeys.has(titleStem))
+      ) {
+        return false;
+      }
+      usedSourceUrls.add(item.thumbUrl);
+      if (canonUrl) usedSourceUrls.add(canonUrl);
+      if (fallbackCanonUrl) usedSourceUrls.add(fallbackCanonUrl);
+      if (titleStem.length >= 16) usedTitleKeys.add(titleStem);
+      candidates.push(item);
+      return true;
+    };
 
     const scoreCandidate = (title: string, url: string, w: number, h: number) => {
       let s = 2;
       const hasKnownDims = w > 0 && h > 0;
       const ratio = hasKnownDims ? w / Math.max(1, h) : 1.0;
-      // Favor real movie stills (4:3, 3:2) & candid archival photos without penalizing landscape film frames
-      if (hasKnownDims && ratio >= 0.62 && ratio <= 1.56) s += 12;
-      else if (hasKnownDims && ratio > 1.56 && ratio <= 1.65) s += 4;
-      else if (hasKnownDims && ratio > 1.65) s -= 18;
+      // Favor real movie stills (4:3, 3:2, 16:9), live stage performances & candid archival photos
+      if (hasKnownDims && ratio >= 0.62 && ratio <= 1.82) s += 12;
+      else if (hasKnownDims && ratio > 1.82 && ratio <= 1.88) s += 4;
+      else if (hasKnownDims && ratio > 1.88) s -= 18;
       if (w >= 550 && h >= 420) s += 4;
       else if (w >= 360 && h >= 300) s += 2;
-      if (/\b(movie|film|still|scene|cinema|starring|screencap|on\s+set|behind\s+the\s+scenes|candid|interview|premiere|filming|archival|event|rodeo|training|action|live)\b/i.test(`${title} ${url}`)) {
+      if (/\b(movie|film|still|scene|cinema|starring|screencap|concert|performing|singing|on\s+stage|live\s+performance|microphone|guitar|on\s+set|behind\s+the\s+scenes|candid|interview|premiere|filming|archival|event|rodeo|training|action|live)\b/i.test(`${title} ${url}`)) {
         s += 10;
       }
       if (isPosedPortraitOrHeadshotPhoto(title, url)) {
@@ -3311,13 +3380,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       ]);
 
       for (const item of [...wikiMediaHits, ...commonsCatHits]) {
-        const urlKey = normalizeTitleKey(item.thumbUrl);
-        const titleKey = normalizeTitleKey(item.title);
-        if (usedSourceUrls.has(item.thumbUrl) || (urlKey && usedTitleKeys.has(urlKey)) || (titleKey && titleKey.length >= 12 && usedTitleKeys.has(titleKey))) continue;
-        usedSourceUrls.add(item.thumbUrl);
-        if (urlKey) usedTitleKeys.add(urlKey);
-        if (titleKey && titleKey.length >= 12) usedTitleKeys.add(titleKey);
-        candidates.push(item);
+        registerCandidateIfUnique(item);
       }
     }
 
@@ -3325,20 +3388,20 @@ For every scene, ensure smooth chronological transitions from one scene to the n
     const maxDdgCalls = options?.maxDdgCalls ?? 1;
 
     for (const q of candidateQueries.slice(0, 2)) {
-      if (candidates.length >= limit + 5) break;
+      if (candidates.length >= limit * 2 + 8) break;
 
       const cleanedQ = q
         .replace(/\b(happy|birthday|wishes|collage|composite|montage|grid|portrait|headshot)\b/gi, " ")
         .replace(/\s+/g, " ")
         .trim();
-      const hasSceneOrStillTerm = /\b(still|scene|movie|film|candid|behind|on\s+set|interview|rodeo|concert|stage|premiere|award|real\s+life|archival)\b/i.test(
+      const hasSceneOrStillTerm = /\b(still|scene|movie|film|concert|stage|singing|performing|live|candid|behind|on\s+set|interview|rodeo|premiere|award|real\s+life|archival)\b/i.test(
         cleanedQ
       );
       const searchBaseQuery = hasSceneOrStillTerm
         ? cleanedQ
         : `${cleanedQ} movie still candid photo`;
-      const bingQuery = `${searchBaseQuery} -collage -poster`.trim();
-      const ddgQuery = `${searchBaseQuery} -drawing -painting -illustration -sketch -cartoon -portrait -headshot -collage -montage -split -comparison -grid -poster -cover -mugshot -"then and now" -"before and after"`;
+      const bingQuery = searchBaseQuery.trim();
+      const ddgQuery = `${searchBaseQuery} -drawing -painting -illustration -sketch -cartoon -portrait -headshot -collage -poster`;
 
       const shouldQueryDdg = ddgCallCount < maxDdgCalls;
       if (shouldQueryDdg) ddgCallCount++;
@@ -3352,18 +3415,22 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             const primaryBing = await runBingImageSearchCached(bingQuery, {
               faceMode: bingFaceMode,
               tallAspect: false,
+              pageOffset,
             });
             const secondaryBing =
-              primaryBing.length < 4
+              primaryBing.length < 10
                 ? await runBingImageSearchCached(bingQuery, {
                     faceMode: "none",
                     tallAspect: false,
+                    pageOffset,
                   })
                 : [];
             const seenBing = new Set<string>();
             const mergedBing = [...primaryBing, ...secondaryBing].filter((item) => {
-              if (!item.imageUrl || seenBing.has(item.imageUrl)) return false;
+              const canon = canonicalizePhotoIdentityUrl(item.imageUrl);
+              if (!item.imageUrl || seenBing.has(item.imageUrl) || (canon && seenBing.has(canon))) return false;
               seenBing.add(item.imageUrl);
+              if (canon) seenBing.add(canon);
               return true;
             });
 
@@ -3462,7 +3529,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             const ovRes = await fetch(
               `https://api.openverse.org/v1/images/?q=${encodeURIComponent(
                 searchBaseQuery
-              )}&category=photograph&aspect_ratio=tall,square,wide&page_size=${Math.min(28, limit * 2 + 8)}`,
+              )}&category=photograph&aspect_ratio=tall,square,wide&page=${pageOffset + 1}&page_size=${Math.min(28, limit * 2 + 8)}`,
               {
                 headers: { "User-Agent": WIKI_USER_AGENT },
                 signal: AbortSignal.timeout(3200),
@@ -3634,20 +3701,14 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       ]);
 
       for (const item of [...bingList, ...ddgList, ...ovList, ...wpList, ...wmList]) {
-        const urlKey = normalizeTitleKey(item.thumbUrl);
-        const titleKey = normalizeTitleKey(item.title);
-        if (usedSourceUrls.has(item.thumbUrl) || (urlKey && usedTitleKeys.has(urlKey)) || (titleKey && titleKey.length >= 12 && usedTitleKeys.has(titleKey))) continue;
-        usedSourceUrls.add(item.thumbUrl);
-        if (urlKey) usedTitleKeys.add(urlKey);
-        if (titleKey && titleKey.length >= 12) usedTitleKeys.add(titleKey);
-        candidates.push(item);
+        registerCandidateIfUnique(item);
       }
     }
 
     // Sort highest-scoring clean photos first before downloading & pixel-inspecting
     candidates.sort((a, b) => b.score - a.score);
 
-    const poolToVerify = candidates.slice(0, Math.min(candidates.length, limit * 2 + 3));
+    const poolToVerify = candidates.slice(0, Math.min(candidates.length, limit * 3 + 4));
     const verified: VerifiedStagePhotoCandidate[] = [];
 
     const resolvedBatch = await Promise.all(
@@ -3683,12 +3744,25 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             options?.photoCategoryLabel && resolvedCategory === fallbackCategory
               ? options.photoCategoryLabel
               : getClearFaceCategoryLabel(resolvedCategory),
+          visualHash: resolved.visualHash,
+          centerVisualHash: resolved.centerVisualHash,
         };
       })
     );
 
-    for (const r of resolvedBatch) {
-      if (!r) continue;
+    const dedupedResolved = deduplicatePhotoPool(
+      resolvedBatch.filter((x): x is NonNullable<typeof x> => Boolean(x))
+    );
+
+    for (const r of dedupedResolved) {
+      const fp: PhotoVisualFingerprint | null =
+        r.visualHash && r.centerVisualHash
+          ? { dHash: r.visualHash, centerDHash: r.centerVisualHash }
+          : null;
+      if (fp && sharedFingerprints.some((prev) => arePerceptuallyDuplicateFingerprints(prev, fp))) {
+        continue;
+      }
+      if (fp) sharedFingerprints.push(fp);
       verified.push(r);
       if (verified.length >= limit) break;
     }
@@ -5140,31 +5214,33 @@ For every scene, ensure smooth chronological transitions from one scene to the n
 
       const usedUrls = new Set<string>();
       const usedTitles = new Set<string>();
+      const sharedFingerprints: PhotoVisualFingerprint[] = [];
+      const pageOffset = Math.max(0, Math.floor(Number(cycleOffset) || 0));
 
       const anchorForSearch =
         rawSearch.toLowerCase().includes(cleanChar.toLowerCase()) ? cleanChar : rawSearch;
       const requestedVideoCount = Math.max(8, Math.min(18, Number(videoLimit) || 14));
 
-      // Build clear-face Film Still + Real-Life Activity + Portrait query plans tailored to this scene!
+      // Build clear-face Film Still + Live Performance + Real-Life Activity query plans tailored to this scene!
       const clearFacePlans = buildClearFaceSceneQueries(
         cleanChar || propChar,
         sceneContext && typeof sceneContext === "object" ? sceneContext : null,
         effectiveFocusMode,
-        { maxQueries: effectiveFocusMode === "all" ? 4 : 3 }
+        { maxQueries: effectiveFocusMode === "all" ? 5 : 4 }
       );
 
       // Rotate slightly on subsequent pages (cycleOffset > 0) so users get fresh stills when clicking "Load More"
       const rotatedPlans =
-        Number(cycleOffset) > 0 && clearFacePlans.length > 1
+        pageOffset > 0 && clearFacePlans.length > 1
           ? [
-              ...clearFacePlans.slice(Number(cycleOffset) % clearFacePlans.length),
-              ...clearFacePlans.slice(0, Number(cycleOffset) % clearFacePlans.length),
+              ...clearFacePlans.slice(pageOffset % clearFacePlans.length),
+              ...clearFacePlans.slice(0, pageOffset % clearFacePlans.length),
             ]
           : clearFacePlans;
 
       const perPlanLimit = Math.max(
-        4,
-        Math.ceil((Math.max(10, Number(limit) || 14) + 2) / Math.max(1, rotatedPlans.length))
+        5,
+        Math.ceil((Math.max(14, Number(limit) || 18) + 4) / Math.max(1, rotatedPlans.length))
       );
 
       const [videos, clearFacePhotoLists, contextualPhotos] = await Promise.all([
@@ -5176,7 +5252,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
               usedUrls,
               cleanChar,
               usedTitles,
-              Number(cycleOffset) || 0
+              pageOffset
             ),
         Promise.all(
           rotatedPlans.map((plan, idx) =>
@@ -5194,8 +5270,10 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 photoCategoryLabel: getClearFaceCategoryLabel(plan.category),
                 stage: plan.stage,
                 stageLabel: plan.stageLabelVi,
-                skipCanonical: idx > 0 || effectiveFocusMode === "film-still" || effectiveFocusMode === "activity-scene",
+                skipCanonical: idx > 0 || pageOffset > 0 || effectiveFocusMode === "film-still" || effectiveFocusMode === "activity-scene",
                 maxDdgCalls: idx === 0 ? 1 : 0,
+                pageOffset,
+                seenFingerprints: sharedFingerprints,
               }
             )
           )
@@ -5203,6 +5281,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
         // Also fetch Wikimedia Commons scene/context photos matching the query directly (no collages)
         (async () => {
           const extra: Array<VerifiedStagePhotoCandidate> = [];
+          if (pageOffset > 0) return extra;
           try {
             const commonsUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
               `filetype:bitmap ${rawSearch} -poster -cover -logo -newspaper -plaque -collage -composite -drawing -painting -illustration -sketch -caricature -portrait -headshot`
@@ -5240,11 +5319,15 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 const h = info?.thumbheight || info?.height || 0;
                 const aspect = w / Math.max(1, h);
                 const combined = `${cleanTitle} ${desc} ${cats}`;
+                const canonUrl = thumbUrl ? canonicalizePhotoIdentityUrl(thumbUrl) : "";
+                const titleStem = canonicalizePhotoTitleStem(cleanTitle);
                 if (
                   !thumbUrl ||
                   usedUrls.has(thumbUrl) ||
+                  (canonUrl && usedUrls.has(canonUrl)) ||
+                  (titleStem.length >= 16 && usedTitles.has(titleStem)) ||
                   (!mime.includes("jpeg") && !mime.includes("png")) ||
-                  aspect > 1.56 ||
+                  aspect > 1.85 ||
                   aspect < 0.45 ||
                   /\b(poster|cover|magazine|newspaper|plaque|grave|marker|logo|icon|map|diagram|signature|autograph|courthouse|water\s*tower|county|township)\b/i.test(
                     combined
@@ -5259,6 +5342,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 }
                 if (w < 260 || h < 260) continue;
                 usedUrls.add(thumbUrl);
+                if (canonUrl) usedUrls.add(canonUrl);
+                if (titleStem.length >= 16) usedTitles.add(titleStem);
                 rawItems.push({
                   title: cleanTitle.slice(0, 56),
                   thumbUrl,
@@ -5285,6 +5370,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                     year: item.year,
                     photoCategory: cat,
                     photoCategoryLabel: getClearFaceCategoryLabel(cat),
+                    visualHash: resolved.visualHash,
+                    centerVisualHash: resolved.centerVisualHash,
                   };
                 })
               );
@@ -5300,11 +5387,11 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       ]);
 
       let flattenedClearFace = clearFacePhotoLists.flat();
-      // Fast safety net: if filtered real-scene plans returned < 4 photos, run one clean broad real-scene fallback for the same character
-      if (flattenedClearFace.length + contextualPhotos.length < 4 && (cleanChar || propChar)) {
+      // Fast safety net: if filtered real-scene plans returned < 6 photos, run one clean broad real-scene fallback for the same character
+      if (flattenedClearFace.length + contextualPhotos.length < 6 && (cleanChar || propChar)) {
         const broadFallback = await searchRealArchivalPhotos(
-          `${cleanChar || propChar} movie still candid photo`,
-          10,
+          `${cleanChar || propChar} movie still live performance candid`,
+          12,
           usedUrls,
           anchorForSearch || cleanChar || propChar,
           usedTitles,
@@ -5314,12 +5401,14 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             allowClassicStillAspect: true,
             skipCanonical: false,
             maxDdgCalls: 0,
+            pageOffset,
+            seenFingerprints: sharedFingerprints,
           }
         );
         flattenedClearFace = [...flattenedClearFace, ...broadFallback];
       }
       const balancedPhotos = sortAndBalanceClearFacePhotos(
-        [...flattenedClearFace, ...contextualPhotos],
+        deduplicatePhotoPool([...flattenedClearFace, ...contextualPhotos]),
         effectiveFocusMode
       );
 
@@ -5328,7 +5417,7 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       const videoOptions = videos.map((v, idx) => {
         const baseStart =
           v.trimStartSec ??
-          variedCutStarts[(idx + Number(cycleOffset || 0)) % variedCutStarts.length];
+          variedCutStarts[(idx + pageOffset) % variedCutStarts.length];
         const trimStartSec = baseStart + (idx > 2 ? idx * 15 : 0);
         const trimEndSec = trimStartSec + dur;
         const distinctThumb =
@@ -5364,6 +5453,8 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           stageLabel: p.stageLabel,
           photoCategory: cat,
           photoCategoryLabel: catLabel,
+          visualHash: p.visualHash,
+          centerVisualHash: p.centerVisualHash,
         };
       });
 
@@ -7685,16 +7776,17 @@ For every scene, ensure smooth chronological transitions from one scene to the n
       }
 
       const cleanChar = cleanCharacterNameForSearch(query) || query.trim();
-      const targetLimit = Math.max(12, Math.min(36, Number(limit) || 24));
+      const targetLimit = Math.max(16, Math.min(36, Number(limit) || 24));
       const usedUrls = new Set<string>(Array.isArray(excludeUrls) ? excludeUrls.filter(Boolean) : []);
       const usedTitles = new Set<string>();
+      const sharedFingerprints: PhotoVisualFingerprint[] = [];
 
       const stagePlans = buildRichStagePhotoQueries(
         cleanChar,
         Array.isArray(scenes) ? scenes : [],
-        { storyMode: String(storyMode || "biography"), maxQueries: 5 }
+        { storyMode: String(storyMode || "biography"), maxQueries: 7 }
       );
-      const perStageLimit = Math.max(4, Math.ceil(targetLimit / Math.max(1, stagePlans.length)) + 1);
+      const perStageLimit = Math.max(5, Math.ceil(targetLimit / Math.max(1, stagePlans.length)) + 2);
 
       const [videos, ...stagePhotoBatches] = await Promise.all([
         searchRealArchivalVideos(cleanChar, 3, usedUrls, cleanChar, usedTitles),
@@ -7711,20 +7803,12 @@ For every scene, ensure smooth chronological transitions from one scene to the n
             stageLabel: plan.stageLabelVi,
             skipCanonical: idx > 0,
             maxDdgCalls: idx === 0 ? 1 : 0,
+            seenFingerprints: sharedFingerprints,
           })
         ),
       ]);
 
-      const mergedPhotos: VerifiedStagePhotoCandidate[] = [];
-      const seenDataKeys = new Set<string>();
-      for (const batch of stagePhotoBatches) {
-        for (const p of batch) {
-          const dataKey = p.dataUrl.slice(0, 120);
-          if (!p.dataUrl || seenDataKeys.has(dataKey)) continue;
-          seenDataKeys.add(dataKey);
-          mergedPhotos.push(p);
-        }
-      }
+      const mergedPhotos = deduplicatePhotoPool(stagePhotoBatches.flat().filter((p) => Boolean(p && p.dataUrl)));
 
       // Rank and annotate all collected photos chronologically & by story stage
       const { annotatedPool } = rankAndAssignStagePhotosToScenes(
@@ -8185,12 +8269,13 @@ For every scene, ensure smooth chronological transitions from one scene to the n
           : buildRichStagePhotoQueries(cleanTopic, visualScenes, {
               storyMode: String(storyMode || "biography"),
               secondaryPerson,
-              maxQueries: isSingleSceneQuickLookup ? 3 : 6,
+              maxQueries: isSingleSceneQuickLookup ? 4 : 7,
             });
 
         const perStageLimit = isSingleSceneQuickLookup
-          ? 5
-          : Math.max(4, Math.ceil((visualScenes.length * 2) / Math.max(1, stagePlans.length)) + 1);
+          ? 6
+          : Math.max(5, Math.ceil((visualScenes.length * 2.5) / Math.max(1, stagePlans.length)) + 1);
+        const matchFingerprints: PhotoVisualFingerprint[] = [];
 
         const [foundVideos, ...eraPhotoLists] = await Promise.all([
           skipVideoCuts || isSingleSceneQuickLookup
@@ -8217,15 +8302,14 @@ For every scene, ensure smooth chronological transitions from one scene to the n
                 stageLabel: plan.stageLabelVi,
                 skipCanonical: idx > 0,
                 maxDdgCalls: idx === 0 ? 1 : 0,
+                seenFingerprints: matchFingerprints,
               }
             );
           }),
         ]);
 
         verifiedVideos.push(...foundVideos);
-        for (const list of eraPhotoLists) {
-          verifiedPool.push(...list);
-        }
+        verifiedPool.push(...deduplicatePhotoPool(eraPhotoLists.flat()));
       }
 
       // Per-scene targeted archival photo lookup when in Film+Cast mode!

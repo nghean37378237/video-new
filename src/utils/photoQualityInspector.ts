@@ -157,9 +157,9 @@ export function evaluateCandidateAspectForClearFace(
   }
 
   // For vertical 3:4 & 9:16 storytelling:
-  // Wide 16:9 / 2:1 photos are almost always 2-panel side-by-side collages, group photos, or wide stage shots
-  // where center-cropping slices the character's face right off!
-  const maxAllowedAspect = options.allowClassicWideStill ? 1.62 : 1.38;
+  // When allowClassicWideStill is true (movie stills & live stage performances), allow up to 16:9 (1.85)
+  // while still blocking ultra-wide 2:1 banners & 2-panel side-by-side collages (and pixel seam check catches split screens).
+  const maxAllowedAspect = options.allowClassicWideStill ? 1.85 : 1.38;
   if (aspect > maxAllowedAspect) {
     return {
       ok: false,
@@ -357,4 +357,253 @@ export function analyzeRawRgbForSplitOrBadFraming(
     hasSolidVertBar,
     hasSolidHorizBar,
   };
+}
+
+export interface PhotoVisualFingerprint {
+  dHash: string;
+  centerDHash: string;
+}
+
+function computeRegionDHash64(
+  raw: Uint8Array,
+  W: number,
+  H: number,
+  x0Frac: number,
+  y0Frac: number,
+  x1Frac: number,
+  y1Frac: number
+): string {
+  const cols = 9;
+  const rows = 8;
+  const grid = new Float32Array(cols * rows);
+
+  const rx0 = Math.max(0, Math.floor(W * x0Frac));
+  const ry0 = Math.max(0, Math.floor(H * y0Frac));
+  const rx1 = Math.min(W, Math.ceil(W * x1Frac));
+  const ry1 = Math.min(H, Math.ceil(H * y1Frac));
+  const rw = Math.max(1, rx1 - rx0);
+  const rh = Math.max(1, ry1 - ry0);
+
+  for (let r = 0; r < rows; r++) {
+    const sy0 = ry0 + Math.floor((r * rh) / rows);
+    const sy1 = Math.max(sy0 + 1, ry0 + Math.floor(((r + 1) * rh) / rows));
+    for (let c = 0; c < cols; c++) {
+      const sx0 = rx0 + Math.floor((c * rw) / cols);
+      const sx1 = Math.max(sx0 + 1, rx0 + Math.floor(((c + 1) * rw) / cols));
+      let sum = 0;
+      let count = 0;
+      for (let y = sy0; y < sy1 && y < H; y++) {
+        for (let x = sx0; x < sx1 && x < W; x++) {
+          const i = (y * W + x) * 3;
+          sum += 0.299 * raw[i] + 0.587 * raw[i + 1] + 0.114 * raw[i + 2];
+          count++;
+        }
+      }
+      grid[r * cols + c] = count > 0 ? sum / count : 0;
+    }
+  }
+
+  let hex = '';
+  for (let r = 0; r < rows; r++) {
+    let byteVal = 0;
+    for (let c = 0; c < 8; c++) {
+      const left = grid[r * cols + c];
+      const right = grid[r * cols + c + 1];
+      if (left > right) {
+        byteVal |= 1 << (7 - c);
+      }
+    }
+    hex += byteVal.toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+/**
+ * Computes both full-frame 64-bit dHash and inner-72% center-crop 64-bit dHash
+ * from a decoded RGB24 buffer so resized, re-encoded, watermark-cropped, or
+ * cross-domain copies of the exact same photograph are caught reliably.
+ */
+export function computeVisualFingerprintFromRgb(
+  raw: Uint8Array,
+  W: number,
+  H: number
+): PhotoVisualFingerprint | null {
+  if (!raw || raw.length < W * H * 3 || W < 16 || H < 16) return null;
+  return {
+    dHash: computeRegionDHash64(raw, W, H, 0, 0, 1, 1),
+    centerDHash: computeRegionDHash64(raw, W, H, 0.14, 0.14, 0.86, 0.86),
+  };
+}
+
+const POPCOUNT_4BIT = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
+
+export function hammingDistanceHex64(a: string, b: string): number {
+  if (!a || !b || a.length !== 16 || b.length !== 16) return 64;
+  let dist = 0;
+  for (let i = 0; i < 16; i++) {
+    const na = parseInt(a[i], 16);
+    const nb = parseInt(b[i], 16);
+    if (Number.isNaN(na) || Number.isNaN(nb)) return 64;
+    dist += POPCOUNT_4BIT[(na ^ nb) & 0xf];
+  }
+  return dist;
+}
+
+/**
+ * Returns true when two photos are visually identical or cropped/resized copies
+ * of the same source image.
+ */
+export function arePerceptuallyDuplicateFingerprints(
+  a?: Partial<PhotoVisualFingerprint> | null,
+  b?: Partial<PhotoVisualFingerprint> | null
+): boolean {
+  if (!a || !b) return false;
+  if (a.dHash && b.dHash && hammingDistanceHex64(a.dHash, b.dHash) <= 10) {
+    return true;
+  }
+  if (
+    a.centerDHash &&
+    b.centerDHash &&
+    hammingDistanceHex64(a.centerDHash, b.centerDHash) <= 8
+  ) {
+    return true;
+  }
+  if (a.dHash && b.centerDHash && hammingDistanceHex64(a.dHash, b.centerDHash) <= 8) {
+    return true;
+  }
+  if (a.centerDHash && b.dHash && hammingDistanceHex64(a.centerDHash, b.dHash) <= 8) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Normalizes Wikimedia thumbnail vs original URLs, Pinterest resolution variants,
+ * and CDN query parameters into a single canonical identity key so identical files
+ * from different hosts/sizes collapse to one key before downloading.
+ */
+export function canonicalizePhotoIdentityUrl(rawUrl: string): string {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed) return '';
+  let decoded = trimmed;
+  try {
+    decoded = decodeURIComponent(trimmed);
+  } catch {
+    decoded = trimmed;
+  }
+
+  // Strip query string and hash
+  const noQuery = decoded.replace(/[?#].*$/, '');
+
+  // 1. Wikimedia / Wikipedia canonical filename (handles both /thumb/a/ab/Name.jpg/500px-Name.jpg and /a/ab/Name.jpg)
+  if (/wikim?edia\.org|wikipedia\.org/i.test(noQuery)) {
+    const thumbMatch = noQuery.match(/\/thumb\/[^/]+\/[^/]+\/([^/]+)\/\d+px-/i);
+    const baseName = thumbMatch
+      ? thumbMatch[1]
+      : noQuery.split('/').pop() || '';
+    const cleaned = baseName
+      .toLowerCase()
+      .replace(/^\d+px-/, '')
+      .replace(/\.[^/.]+$/, '')
+      .replace(/\([^)]*crop[^)]*\)/gi, '')
+      .replace(/\b(cropped|crop|retouched|restored|enhanced|bw|colorized|4x5|3x4|16x9)\b/gi, '')
+      .replace(/[^a-z0-9]/g, '');
+    return cleaned ? `wm:${cleaned}` : '';
+  }
+
+  // 2. Pinterest i.pinimg.com resolution variants (/736x/, /474x/, /236x/, /originals/) -> same hash path
+  if (/pinimg\.com/i.test(noQuery)) {
+    const pinMatch = noQuery.match(/pinimg\.com\/(?:originals|\d+x)\/(.+)$/i);
+    if (pinMatch) {
+      return `pin:${pinMatch[1].toLowerCase()}`;
+    }
+  }
+
+  // 3. General web URL: strip protocol, www, resize query/path tokens
+  const general = noQuery
+    .toLowerCase()
+    .replace(/^https?:\/\/(www\.)?/, '')
+    .replace(/-\d{2,4}x\d{2,4}(?=\.[a-z]{3,4}$)/, '')
+    .replace(/\.(jpe?g|png|webp)$/i, '');
+  return `url:${general}`;
+}
+
+/**
+ * Normalizes a photo title into a base stem stripping crop annotations, stage prefixes,
+ * and copy numbering so "Bruce Lee with his parents 1940s" and
+ * "Bruce Lee with his parents 1940s (Grace Ho cropped)" collide as duplicates.
+ */
+export function canonicalizePhotoTitleStem(rawTitle: string): string {
+  return String(rawTitle || '')
+    .toLowerCase()
+    .replace(/^\[[^\]]+\]\s*/, '')
+    .replace(/^file:/i, '')
+    .replace(/\.[^/.]+$/, '')
+    .replace(/\([^)]*(?:crop|cropped|4x5|3x4|retouch|restored|detail|closeup)[^)]*\)/gi, ' ')
+    .replace(/\b(?:cropped|crop|retouched|restored)\b/gi, ' ')
+    .replace(/#\d+\b/g, ' ')
+    .replace(/\b\d+px\b/g, ' ')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+export interface DeduplicatablePhotoItem {
+  title?: string;
+  dataUrl?: string;
+  sourceUrl?: string;
+  visualHash?: string;
+  centerVisualHash?: string;
+}
+
+/**
+ * Pure multi-layer deduplicator that eliminates:
+ * 1. Exact dataUrl duplicates
+ * 2. Canonical Wikimedia / Pinterest / CDN URL duplicates
+ * 3. Cropped-title derivative duplicates (e.g., "... (Grace Ho cropped)")
+ * 4. Perceptual visual near-duplicates via 64-bit dHash & center-crop dHash
+ */
+export function deduplicatePhotoPool<T extends DeduplicatablePhotoItem>(items: T[]): T[] {
+  const kept: T[] = [];
+  const seenDataSigs = new Set<string>();
+  const seenUrlKeys = new Set<string>();
+  const seenTitleStems = new Set<string>();
+  const seenFingerprints: PhotoVisualFingerprint[] = [];
+
+  for (const item of items) {
+    if (!item) continue;
+
+    if (item.dataUrl) {
+      const sig = `${item.dataUrl.length}:${item.dataUrl.slice(0, 120)}:${item.dataUrl.slice(-48)}`;
+      if (seenDataSigs.has(sig)) continue;
+    }
+
+    const urlKey = canonicalizePhotoIdentityUrl(item.sourceUrl || '');
+    if (urlKey && seenUrlKeys.has(urlKey)) continue;
+
+    const titleStem = canonicalizePhotoTitleStem(item.title || '');
+    if (titleStem.length >= 16 && seenTitleStems.has(titleStem)) continue;
+
+    const fp: Partial<PhotoVisualFingerprint> | null =
+      item.visualHash || item.centerVisualHash
+        ? {
+            dHash: item.visualHash || '',
+            centerDHash: item.centerVisualHash || '',
+          }
+        : null;
+    if (fp && seenFingerprints.some((prev) => arePerceptuallyDuplicateFingerprints(prev, fp))) {
+      continue;
+    }
+
+    if (item.dataUrl) {
+      const sig = `${item.dataUrl.length}:${item.dataUrl.slice(0, 120)}:${item.dataUrl.slice(-48)}`;
+      seenDataSigs.add(sig);
+    }
+    if (urlKey) seenUrlKeys.add(urlKey);
+    if (titleStem.length >= 16) seenTitleStems.add(titleStem);
+    if (fp && fp.dHash && fp.centerDHash) {
+      seenFingerprints.push({ dHash: fp.dHash, centerDHash: fp.centerDHash });
+    }
+    kept.push(item);
+  }
+
+  return kept;
 }

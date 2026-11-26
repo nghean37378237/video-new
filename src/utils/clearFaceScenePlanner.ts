@@ -1,5 +1,6 @@
 import type { AspectRatioOption } from '../types';
 import { getAspectRatioSpec } from './fullFrameHelper';
+import { deduplicatePhotoPool } from './photoQualityInspector';
 import {
   cleanCharacterNameForSearch,
   classifySceneStoryStage,
@@ -37,6 +38,8 @@ export interface ClearFacePhotoItem {
   stageLabel?: string;
   photoCategory?: ClearFacePhotoCategory;
   photoCategoryLabel?: string;
+  visualHash?: string;
+  centerVisualHash?: string;
 }
 
 export const CLEAR_FACE_CATEGORY_META: Record<
@@ -49,10 +52,10 @@ export const CLEAR_FACE_CATEGORY_META: Record<
   }
 > = {
   'film-still': {
-    labelVi: 'Cảnh Phim Rõ Mặt',
-    shortVi: 'Cảnh Phim',
+    labelVi: 'Cảnh Phim & Biểu Diễn Rõ Mặt',
+    shortVi: 'Phim & Diễn',
     badgeEmoji: '🎬',
-    regTipVi: 'Khung cảnh phim rõ mặt nhân vật — lý tưởng để reg video diễn xuất tự nhiên (Grok / Kling AI).',
+    regTipVi: 'Khung cảnh phim hoặc sân khấu biểu diễn rõ mặt — lý tưởng để reg video diễn xuất tự nhiên (Grok / Kling AI).',
   },
   'activity-scene': {
     labelVi: 'Ảnh Thực Tế & Hậu Trường',
@@ -69,7 +72,7 @@ export const CLEAR_FACE_CATEGORY_META: Record<
 };
 
 const FILM_STILL_SIGNAL_REGEX =
-  /\b(movie|film|still|scene|cinema|starring|character|role|screenshot|screencap|screen\s*cap|episode|tv\s*series|television|western|drama|cuckoo|josey\s+wales|bromden|ten\s+bears|cast|trailer|production\s+still|publicity\s+still|in\s+the\s+movie|as\s+[A-Z][a-z]+)\b/i;
+  /\b(movie|film|still|scene|cinema|starring|character|role|screenshot|screencap|screen\s*cap|episode|tv\s*series|television|western|drama|cuckoo|josey\s+wales|bromden|ten\s+bears|cast|trailer|production\s+still|publicity\s+still|in\s+the\s+movie|as\s+[A-Z][a-z]+|live\s+performance|in\s+concert|concert\s+stage|performing\s+live|on\s+stage|stage\s+performance|singing\s+live)\b/i;
 
 const ACTIVITY_SCENE_SIGNAL_REGEX =
   /\b(behind\s+the\s+scenes|on\s+set|filming|directing|interview|speaking|speech|talk\s+show|press\s+conference|premiere|award|oscar|academy|ceremony|festival|candid|rodeo|horse|horseback|cowboy|riding|studio\s+work|guitar|singing|concert|performing|rehearsal|training|martial\s+arts|boxing|rally|activist|event|gala|backstage|off\s+screen|working|reading|writing|playing|real\s+life|archival|live)\b/i;
@@ -239,6 +242,12 @@ export function buildClearFaceSceneQueries(
   const wantFilm = mode === 'all' || mode === 'film-still';
   const wantActivity = mode === 'all' || mode === 'activity-scene' || mode === 'portrait';
 
+  const contextAll = `${rawCharacterName} ${scene?.title || ''} ${scene?.narrationText || ''} ${scene?.archivalKeywords || ''}`;
+  const isPerformerOrSinger =
+    /\b(singer|singing|song|concert|guitar|piano|album|musician|band|vocalist|tour|microphone|stage|grammy|elvis|presley|dolly\s+parton|sinatra|johnny\s+cash|whitney|michael\s+jackson|freddie\s+mercury|bob\s+dylan|celine|adele|taylor\s+swift|madonna|beyonce|cher|bowie|lennon|streisand|willie\s+nelson|ca\s*sĩ|biểu\s*diễn|sân\s*khấu)\b/i.test(
+      contextAll
+    );
+
   if (wantFilm) {
     if (anchors.filmOrRoleTerms.length > 0) {
       addPlan({
@@ -249,8 +258,32 @@ export function buildClearFaceSceneQueries(
         allowClassicStillAspect: true,
         allowMultiSubject: true,
         stage: 'peak-cinema',
-        stageLabelVi: '🎬 Cảnh Phim Rõ Mặt',
+        stageLabelVi: '🎬 Cảnh Phim & Biểu Diễn',
         priority: 10,
+      });
+    }
+    if (isPerformerOrSinger) {
+      addPlan({
+        query: `${cleanChar} live concert singing on stage`,
+        category: 'film-still',
+        categoryLabelVi: CLEAR_FACE_CATEGORY_META['film-still'].labelVi,
+        bingFaceMode: 'face',
+        allowClassicStillAspect: true,
+        allowMultiSubject: true,
+        stage: 'peak-cinema',
+        stageLabelVi: '🎤 Cảnh Biểu Diễn Sân Khấu',
+        priority: 10,
+      });
+      addPlan({
+        query: `${cleanChar} performing live microphone closeup`,
+        category: 'film-still',
+        categoryLabelVi: CLEAR_FACE_CATEGORY_META['film-still'].labelVi,
+        bingFaceMode: 'face',
+        allowClassicStillAspect: true,
+        allowMultiSubject: true,
+        stage: 'peak-cinema',
+        stageLabelVi: '🎤 Cảnh Biểu Diễn Sân Khấu',
+        priority: 9,
       });
     }
     addPlan({
@@ -264,6 +297,19 @@ export function buildClearFaceSceneQueries(
       stageLabelVi: '🎬 Cảnh Phim Rõ Mặt',
       priority: 9,
     });
+    if (!isPerformerOrSinger) {
+      addPlan({
+        query: `${cleanChar} performing live stage tv appearance`,
+        category: 'film-still',
+        categoryLabelVi: CLEAR_FACE_CATEGORY_META['film-still'].labelVi,
+        bingFaceMode: 'face',
+        allowClassicStillAspect: true,
+        allowMultiSubject: true,
+        stage: 'peak-cinema',
+        stageLabelVi: '🎬 Cảnh Phim & Biểu Diễn',
+        priority: 8,
+      });
+    }
     if (mode === 'film-still') {
       addPlan({
         query: `${cleanChar}${yearSuffix} film scene`,
@@ -290,14 +336,16 @@ export function buildClearFaceSceneQueries(
         });
       } else {
         addPlan({
-          query: `${cleanChar} actor scene`,
+          query: isPerformerOrSinger
+            ? `${cleanChar} singing stage concert performance`
+            : `${cleanChar} actor scene closeup`,
           category: 'film-still',
           categoryLabelVi: CLEAR_FACE_CATEGORY_META['film-still'].labelVi,
           bingFaceMode: 'face',
           allowClassicStillAspect: true,
           allowMultiSubject: true,
           stage: 'peak-cinema',
-          stageLabelVi: '🎬 Cảnh Phim Rõ Mặt',
+          stageLabelVi: '🎬 Cảnh Phim & Biểu Diễn',
           priority: 7,
         });
       }
@@ -381,16 +429,18 @@ export function sortAndBalanceClearFacePhotos<T extends ClearFacePhotoItem>(
   preferredMode: ClearFaceSearchMode = 'all'
 ): Array<T & { photoCategory: ClearFacePhotoCategory; photoCategoryLabel: string }> {
   type TaggedItem = T & { photoCategory: ClearFacePhotoCategory; photoCategoryLabel: string };
-  const deduped: TaggedItem[] = [];
-  const seen = new Set<string>();
-  for (const p of photos) {
-    if (!p || !p.dataUrl) continue;
+  const cleanedRaw = photos.filter((p) => {
+    if (!p || !p.dataUrl) return false;
     // Strictly block drawings/paintings/illustrations and posed studio portraits/headshots
-    if (isDrawingOrIllustrationPhoto(p.title, p.sourceUrl || '')) continue;
-    if (isPosedPortraitOrHeadshotPhoto(p.title, p.sourceUrl || '')) continue;
-    const key = p.dataUrl.slice(0, 140);
-    if (seen.has(key)) continue;
-    seen.add(key);
+    if (isDrawingOrIllustrationPhoto(p.title, p.sourceUrl || '')) return false;
+    if (isPosedPortraitOrHeadshotPhoto(p.title, p.sourceUrl || '')) return false;
+    return true;
+  });
+
+  // Multi-layer dedup: exact dataUrl, canonical Wikimedia/Pinterest URL, cropped title stem, & perceptual dHash
+  const uniqueRaw = deduplicatePhotoPool(cleanedRaw);
+  const deduped: TaggedItem[] = [];
+  for (const p of uniqueRaw) {
     const classified = classifyClearFacePhotoCategory(p.title, p.sourceUrl || '', p.stage);
     const rawCat = p.photoCategory && p.photoCategory !== 'portrait' ? p.photoCategory : classified;
     if (rawCat === 'portrait') continue;
@@ -418,9 +468,9 @@ export function sortAndBalanceClearFacePhotos<T extends ClearFacePhotoItem>(
     const w = item.width || 720;
     const h = item.height || 960;
     const aspect = w / Math.max(1, h);
-    if (aspect >= 0.62 && aspect <= 1.56) s += 12;
-    else if (aspect > 1.56 && aspect <= 1.65) s += 4;
-    else if (aspect > 1.65) s -= 24;
+    if (aspect >= 0.62 && aspect <= 1.82) s += 12;
+    else if (aspect > 1.82 && aspect <= 1.88) s += 4;
+    else if (aspect > 1.88) s -= 24;
 
     if (Math.min(w, h) >= 480) s += 6;
     if (isGenericOrNonFacePhoto(item.title, item.sourceUrl || '')) s -= 50;

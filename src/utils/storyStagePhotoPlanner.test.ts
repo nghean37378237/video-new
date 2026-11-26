@@ -276,11 +276,14 @@ test('extractHistoricalPhotoYear ignores birth-death lifespans and modern articl
   );
 });
 
-test('isGenericOrNonFacePhoto blocks split-screen collages, then-and-now comparisons, and distant crowd/back-view shots', () => {
+test('isGenericOrNonFacePhoto blocks split-screen collages, then-and-now comparisons, statues/exhibits, and distant crowd/back-view shots', () => {
   assert.equal(isGenericOrNonFacePhoto('Dolly Parton Then and Now Transformation'), true);
   assert.equal(isGenericOrNonFacePhoto('Dolly Parton before and after side by side split screen'), true);
   assert.equal(isGenericOrNonFacePhoto('Dolly Parton concert crowd stage wide shot'), true);
   assert.equal(isGenericOrNonFacePhoto('Singer back view silhouette on full stage'), true);
+  assert.equal(isGenericOrNonFacePhoto('Avenue of Stars Bruce Lee'), true);
+  assert.equal(isGenericOrNonFacePhoto('HK Heritage Museum Bruce Lee exhibit'), true);
+  assert.equal(isGenericOrNonFacePhoto('Lot Detail - Elvis Presley Stage Used Custom Made Shure'), true);
   assert.equal(isGenericOrNonFacePhoto('Dolly Parton solo studio portrait closeup 1977'), false);
 });
 
@@ -353,6 +356,78 @@ test('rankAndAssignStagePhotosToScenes strongly prefers real movie still over st
 
   const res = rankAndAssignStagePhotosToScenes(scenes, pool, 'John Wayne');
   assert.equal(res.assignedBySceneId['d1']?.dataUrl, 'data:image/jpeg;base64,REAL_FILM_STILL');
+});
+
+test('buildRichStagePhotoQueries includes live concert and stage performance queries for singers/performers', () => {
+  const elvisQueries = buildRichStagePhotoQueries('Elvis Presley', [], { maxQueries: 8 });
+  assert.ok(elvisQueries.length >= 6);
+  assert.ok(
+    elvisQueries.some((q) => /(concert|live|stage|singing|performance|microphone)/i.test(q.query)),
+    `Expected singer queries to include live concert/stage performance: ${JSON.stringify(elvisQueries.map((q) => q.query))}`
+  );
+  assert.ok(
+    elvisQueries.some((q) => /(movie|film|scene|still)/i.test(q.query)),
+    `Expected Elvis queries to also include movie scene stills: ${JSON.stringify(elvisQueries.map((q) => q.query))}`
+  );
+});
+
+test('rankAndAssignStagePhotosToScenes deduplicates near-duplicate photos and avoids adjacent reuse when scenes exceed unique photos', () => {
+  const scenes: StorySceneSummaryInput[] = Array.from({ length: 5 }, (_, idx) => ({
+    id: `scene-${idx + 1}`,
+    order: idx + 1,
+    title: `Cảnh ${idx + 1} của Elvis Presley`,
+    sceneType: 'image' as const,
+    narrationText: `Elvis Presley performs on stage in scene ${idx + 1}.`,
+    archivalKeywords: 'Elvis Presley live concert',
+  }));
+
+  const pool: VerifiedStagePhotoCandidate[] = [
+    {
+      title: 'Elvis Presley live concert stage singing 1970',
+      dataUrl: 'data:image/jpeg;base64,ELVIS_CONCERT_A_111111111111',
+      sourceUrl: 'https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Elvis_1970.jpg/500px-Elvis_1970.jpg',
+      width: 1280,
+      height: 720,
+      year: 1970,
+      stage: 'peak-cinema',
+      visualHash: '0f0f0f0f0f0f0f0f',
+      centerVisualHash: '0f0f0f0f0f0f0f0f',
+    },
+    {
+      // Wikimedia full-res duplicate of the first photo
+      title: 'Elvis Presley live concert stage singing 1970',
+      dataUrl: 'data:image/jpeg;base64,ELVIS_CONCERT_A_FULL_222222',
+      sourceUrl: 'https://upload.wikimedia.org/wikipedia/commons/a/ab/Elvis_1970.jpg',
+      width: 1600,
+      height: 900,
+      year: 1970,
+      stage: 'peak-cinema',
+      visualHash: '0f0f0f0f0f0f0f0f',
+      centerVisualHash: '0f0f0f0f0f0f0f0f',
+    },
+    {
+      title: 'Elvis Presley Jailhouse Rock movie scene still 1957',
+      dataUrl: 'data:image/jpeg;base64,ELVIS_MOVIE_B_333333333333',
+      sourceUrl: 'https://example.com/elvis-jailhouse-1957.jpg',
+      width: 1280,
+      height: 720,
+      year: 1957,
+      stage: 'breakthrough',
+      visualHash: 'f0f0f0f0f0f0f0f0',
+      centerVisualHash: 'f0f0f0f0f0f0f0f0',
+    },
+  ];
+
+  const res = rankAndAssignStagePhotosToScenes(scenes, pool, 'Elvis Presley');
+  const assignedUrls = scenes.map((s) => res.assignedBySceneId[s.id]?.dataUrl);
+  assert.equal(new Set(assignedUrls.slice(0, 2)).size, 2);
+  for (let i = 1; i < assignedUrls.length; i++) {
+    assert.notEqual(
+      assignedUrls[i],
+      assignedUrls[i - 1],
+      `Adjacent scenes ${i} and ${i + 1} reused the same photo: ${assignedUrls[i]}`
+    );
+  }
 });
 
 

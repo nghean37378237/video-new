@@ -43,6 +43,7 @@ import {
   KLING_NEGATIVE_PROMPT,
   VideoScriptStyle,
 } from '../utils/fullFrameHelper';
+import { deduplicatePhotoPool } from '../utils/photoQualityInspector';
 import {
   classifySceneStoryStage,
   cleanCharacterNameForSearch,
@@ -244,9 +245,12 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
         stageLabel?: string;
         photoCategory?: ClearFacePhotoCategory;
         photoCategoryLabel?: string;
+        visualHash?: string;
+        centerVisualHash?: string;
       }>
     >
   >({});
+  const [clearFaceCycleByMode, setClearFaceCycleByMode] = useState<Record<string, number>>({});
   const [seenScenePhotoUrls, setSeenScenePhotoUrls] = useState<Record<string, string[]>>({});
   const [clearFaceFetchMode, setClearFaceFetchMode] = useState<ClearFaceSearchMode | null>(null);
   const [activePhotoCatFilter, setActivePhotoCatFilter] = useState<ClearFaceSearchMode>('all');
@@ -364,6 +368,10 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
       const cleanCharName =
         cleanCharacterNameForSearch(resolvedActiveCharacterName) ||
         settings.projectTitle;
+      const cycleKey = `${activeScene.id}:${mode}`;
+      const nextOffset = clearFaceCycleByMode[cycleKey] || 0;
+      setClearFaceCycleByMode((prev) => ({ ...prev, [cycleKey]: nextOffset + 1 }));
+
       const res = await fetch('/api/archival/search-scene-media', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -371,7 +379,8 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
           query: cleanCharName,
           characterName: cleanCharName,
           sceneDurationSec: Math.max(5, Math.round(activeScene.durationSec || 8)),
-          limit: 16,
+          limit: 18,
+          cycleOffset: nextOffset,
           photoFocusMode: mode,
           skipVideos: true,
           sceneContext: {
@@ -393,6 +402,8 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
           stageLabel?: string;
           photoCategory?: ClearFacePhotoCategory;
           photoCategoryLabel?: string;
+          visualHash?: string;
+          centerVisualHash?: string;
         }> = Array.isArray(data?.photoOptions) ? data.photoOptions : [];
 
         if (rawList.length > 0) {
@@ -409,22 +420,18 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
 
           setStagePhotoOptionsByScene((prev) => {
             const existing = prev[activeScene.id] || [];
-            const seen = new Set(normalized.map((p) => p.dataUrl.slice(0, 120)));
-            const merged = [
-              ...normalized,
-              ...existing.filter((p) => !seen.has(p.dataUrl.slice(0, 120))),
-            ].slice(0, 24);
+            const merged = deduplicatePhotoPool([...normalized, ...existing]).slice(0, 32);
             return { ...prev, [activeScene.id]: merged };
           });
           setActivePhotoCatFilter(mode);
           const modeLabel =
             mode === 'film-still'
-              ? 'Ảnh Trong Cảnh Phim'
+              ? 'Cảnh Phim & Biểu Diễn'
               : mode === 'activity-scene'
               ? 'Ảnh Thực Tế & Hậu Trường'
-              : 'Ảnh Thực Tế & Cảnh Phim';
+              : 'Ảnh Thực Tế, Cảnh Phim & Biểu Diễn';
           setClearFaceStatusNote(
-            `✅ Đã bổ sung ${normalized.length} ${modeLabel} (đã loại ảnh vẽ & chân dung) — bấm vào ảnh để gắn & tạo Prompt Reg Video!`
+            `✅ Đã bổ sung ${normalized.length} ${modeLabel} không trùng lặp — bấm vào ảnh để gắn & tạo Prompt Reg Video!`
           );
         } else {
           setClearFaceStatusNote(
@@ -1133,17 +1140,17 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
                 <div className="flex items-center justify-between gap-1.5">
                   <span className="text-[11px] font-bold text-sky-300 flex items-center gap-1">
                     <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    <span>🎬 Bổ Sung Ảnh Thực Tế &amp; Cảnh Phim (Không Ảnh Vẽ / Chân Dung):</span>
+                    <span>🎬 Bổ Sung Cảnh Phim, Biểu Diễn &amp; Ảnh Thực Tế (Không Trùng Lặp):</span>
                   </span>
                 </div>
                 <p className="text-[10px] text-slate-400 leading-snug">
-                  Chỉ lấy ảnh chụp thực tế ngoài đời / hậu trường và ảnh cắt trong cảnh phim — tự động loại ảnh vẽ, tranh minh họa &amp; ảnh chân dung studio.
+                  Tự động lọc trùng ảnh giống nhau, loại ảnh vẽ &amp; chân dung studio — chỉ lấy cảnh phim, sân khấu biểu diễn và ảnh thực tế rõ mặt.
                 </p>
                 <div className="grid grid-cols-2 gap-1.5">
                   {(
                     [
-                      { id: 'film-still' as const, label: '🎬 Ảnh Trong Cảnh Phim', color: 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border-amber-500/40' },
-                      { id: 'activity-scene' as const, label: '📸 Ảnh Thực Tế / Hậu Trường', color: 'bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border-sky-500/40' },
+                      { id: 'film-still' as const, label: '🎬 Cảnh Phim & Biểu Diễn', color: 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border-amber-500/40' },
+                      { id: 'activity-scene' as const, label: '📸 Thực Tế & Hậu Trường', color: 'bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border-sky-500/40' },
                     ]
                   ).map((btn) => {
                     const isLoadingThis = clearFaceFetchMode === btn.id;
@@ -1186,13 +1193,13 @@ export const SceneInspector: React.FC<SceneInspectorProps> = ({
                     <div className="space-y-1.5 pt-1 border-t border-slate-800">
                       <div className="flex flex-wrap items-center justify-between gap-1">
                         <span className="text-[10px] font-semibold text-amber-300">
-                          Chọn ảnh thực tế / cảnh phim để gắn ({visibleOpts.length}/{allSceneOpts.length}):
+                          Chọn ảnh cảnh phim / biểu diễn / thực tế ({visibleOpts.length}/{allSceneOpts.length}):
                         </span>
                         <div className="flex items-center gap-1">
                           {(
                             [
                               { id: 'all' as const, label: 'Tất cả' },
-                              { id: 'film-still' as const, label: '🎬 Cảnh Phim' },
+                              { id: 'film-still' as const, label: '🎬 Phim & Diễn' },
                               { id: 'activity-scene' as const, label: '📸 Thực Tế' },
                             ]
                           ).map((tab) => (

@@ -67,6 +67,8 @@ export interface ScenePhotoOption {
   stageLabel?: string;
   photoCategory?: ClearFacePhotoCategory;
   photoCategoryLabel?: string;
+  visualHash?: string;
+  centerVisualHash?: string;
 }
 
 export interface YouTubeSearchVideoItem {
@@ -1494,8 +1496,8 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
         if (isPosedPortraitOrHeadshotPhoto(p.title || '', p.sourceUrl || '')) return false;
         const w = p.width || 720;
         const h = p.height || 960;
-        // Allow classic 4:3 / 3:2 / 35mm movie stills & real-life candid frames (reject ultra-wide split banners)
-        if (w / Math.max(1, h) > 1.62) return false;
+        // Allow classic 4:3 / 3:2 / 16:9 HD movie & live stage concert stills (reject ultra-wide 2:1 split banners)
+        if (w / Math.max(1, h) > 1.85) return false;
         return true;
       })
       .map((p) => {
@@ -4098,7 +4100,7 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                     <h3 className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
                       <ImageIcon className="w-4 h-4 text-emerald-400" />
                       <span>
-                        Ảnh Thực Tế &amp; Ảnh Trong Cảnh Phim (Đã Loại Ảnh Vẽ &amp; Chân Dung) — Cảnh {sceneNumLabel} ({combinedPhotos.length} ảnh)
+                        Cảnh Phim, Biểu Diễn &amp; Ảnh Thực Tế (Đã Lọc Trùng &amp; Loại Ảnh Vẽ) — Cảnh {sceneNumLabel} ({combinedPhotos.length} ảnh)
                       </span>
                     </h3>
                     <button
@@ -4110,29 +4112,29 @@ export const SceneMediaSearchModal: React.FC<SceneMediaSearchModalProps> = ({
                       {isLoadingClearFacePhotos ? (
                         <>
                           <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                          <span>Đang bổ sung ảnh thực tế &amp; cảnh phim...</span>
+                          <span>Đang bổ sung ảnh mới...</span>
                         </>
                       ) : (
                         <>
                           <RefreshCw className="w-3.5 h-3.5" />
-                          <span>+ Bổ Sung Ảnh Thực Tế &amp; Cảnh Phim</span>
+                          <span>+ Bổ Sung Thêm Ảnh Mới</span>
                         </>
                       )}
                     </button>
                   </div>
 
-                  {/* Category Filter Tabs: Real Film Stills & Real-Life Candid Photos ONLY (No Drawings / Studio Portraits) */}
+                  {/* Category Filter Tabs: Real Film Stills, Live Stage Performances & Real-Life Candid Photos ONLY (Deduplicated) */}
                   <div className="flex flex-wrap items-center gap-1.5">
                     {(
                       [
                         {
                           id: 'all' as const,
-                          label: `✨ Tất Cả Thực Tế & Phim (${allCleanClearFacePhotos.length})`,
+                          label: `✨ Tất Cả Phim, Biểu Diễn & Thực Tế (${allCleanClearFacePhotos.length})`,
                           count: allCleanClearFacePhotos.length,
                         },
                         {
                           id: 'film-still' as const,
-                          label: `🎬 Ảnh Trong Cảnh Phim (${filmStillCount})`,
+                          label: `🎬 Cảnh Phim & Biểu Diễn (${filmStillCount})`,
                           count: filmStillCount,
                         },
                         {
